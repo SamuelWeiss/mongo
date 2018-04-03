@@ -395,6 +395,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     // be retrieved via the ClusterCursorManager.
     CursorId cursorId;
     try {
+        // SAM: another step towards running the query
         cursorId = ClusterFind::runQuery(
             opCtx, *canonicalQuery, ReadPreferenceSetting::get(opCtx), &batch);
     } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>&) {

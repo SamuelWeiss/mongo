@@ -115,6 +115,7 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
             case dbQuery:
                 // Commands are handled above through Strategy::clientCommand().
                 invariant(!nss.isCommand());
+                // SAM: start here
                 dbResponse = Strategy::queryOp(opCtx, nss, &dbm);
                 break;
 

@@ -110,6 +110,8 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(
     return _executor->scheduleWorkAt(when, work);
 }
 
+// SAM: looks like a good place to start
+// This function just does some setup then calls scheduleRemoteCommand on the executor
 StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
     const RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) {
 
@@ -118,6 +120,9 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
         return _executor->scheduleRemoteCommand(request, cb);
     }
 
+    // SAM: relevant to what we saw in the network section, host and port is part
+    // of this request
+    // But, we're also taking in a request so...  
     boost::optional<RemoteCommandRequest> newRequest;
 
     if (request.opCtx->getLogicalSessionId() && !request.cmdObj.hasField("lsid")) {

@@ -53,6 +53,8 @@ const char kPrimaryPreferred[] = "primaryPreferred";
 const char kSecondaryOnly[] = "secondary";
 const char kSecondaryPreferred[] = "secondaryPreferred";
 const char kNearest[] = "nearest";
+const char kDuplicatePrimary[] = "dupePrimary";
+const char kDuplicateSecondary[] = "dupeSecondary";
 
 StringData readPreferenceName(ReadPreference pref) {
     switch (pref) {
@@ -66,6 +68,10 @@ StringData readPreferenceName(ReadPreference pref) {
             return StringData(kSecondaryPreferred);
         case ReadPreference::Nearest:
             return StringData(kNearest);
+        case ReadPreference::DuplicatePrimary:
+            return StringData(kDuplicatePrimary);
+        case ReadPreference::DuplicateSecondary:
+            return StringData(kDuplicateSecondary);
         default:
             MONGO_UNREACHABLE;
     }
@@ -82,6 +88,10 @@ StatusWith<ReadPreference> parseReadPreferenceMode(StringData prefStr) {
         return ReadPreference::SecondaryPreferred;
     } else if (prefStr == kNearest) {
         return ReadPreference::Nearest;
+    } else if (prefStr == kDuplicatePrimary) {
+      return ReadPreference::DuplicatePrimary;
+    } else if (prefStr == kDuplicateSecondary) {
+      return ReadPreference::DuplicateSecondary;
     }
     return Status(ErrorCodes::FailedToParse,
                   str::stream() << "Could not parse $readPreference mode '" << prefStr
@@ -93,8 +103,12 @@ StatusWith<ReadPreference> parseReadPreferenceMode(StringData prefStr) {
                                 << kSecondaryOnly
                                 << "', '"
                                 << kSecondaryPreferred
-                                << "', and '"
+                                << "', '"
                                 << kNearest
+                                << "', '"
+                                << kDuplicatePrimary
+                                << "', and '"
+                                << kDuplicateSecondary
                                 << "' are supported.");
 }
 
@@ -152,6 +166,10 @@ ReadPreferenceSetting::ReadPreferenceSetting(ReadPreference pref, TagSet tags)
 ReadPreferenceSetting::ReadPreferenceSetting(ReadPreference pref)
     : ReadPreferenceSetting(pref, defaultTagSetForMode(pref)) {}
 
+// SAM TODO: copy and switch read preference constructor
+
+// SAM: TODO: figure out how to store/parse this in BSON.
+// For now I'm just going to manually force it
 StatusWith<ReadPreferenceSetting> ReadPreferenceSetting::fromInnerBSON(const BSONObj& readPrefObj) {
     std::string modeStr;
     auto modeExtractStatus = bsonExtractStringField(readPrefObj, kModeFieldName, &modeStr);

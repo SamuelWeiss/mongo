@@ -47,6 +47,48 @@
 
 namespace mongo {
 
+// SAM: one option is to establish two sets of cursors
+// this would take the form of a pair of vectors
+// they would need some awareness that they are the duplicates
+// if read_preference is master only then the second one will be optional (void)
+std::pair<std::vector<ClusterClientCursorParams::RemoteCursor>,
+          std::vector<ClusterClientCursorParams::RemoteCursor>> establishDualCursors(
+    OperationContext* opCtx,
+    executor::TaskExecutor* executor,
+    const NamespaceString& nss,
+    const ReadPreferenceSetting readPref, // can't ignore, just set pref
+    const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+    bool allowPartialResults) {
+
+    // SAM: hack the read perference here lol
+    // SAM: altering this might not be so easy, might have to mock it
+    // readPref.pref = ReadPreference::DuplicatePrimary;
+    auto primPref = ReadPreferenceSetting(ReadPreference::DuplicatePrimary,
+                                          readPref.tags,
+                                          readPref.maxStalenessSeconds);
+    auto primaries = establishCursors(opCtx,
+                                      executor,
+                                      nss,
+                                      primPref,
+                                      remotes,
+                                      allowPartialResults);
+    // readPref.pref = ReadPreference::DuplicateSecondary;
+    auto secPref = ReadPreferenceSetting(ReadPreference::DuplicateSecondary,
+                                         readPref.tags,
+                                         readPref.maxStalenessSeconds);
+    auto secondaries = establishCursors(opCtx,
+                                        executor,
+                                        nss,
+                                        secPref,
+                                        remotes,
+                                        allowPartialResults);
+    // SAM TODO: can't copy the things
+    std::pair <std::vector<ClusterClientCursorParams::RemoteCursor>,
+               std::vector<ClusterClientCursorParams::RemoteCursor>> res (std::move(primaries),
+                                                                          std::move(secondaries));
+    return res;
+}
+
 std::vector<ClusterClientCursorParams::RemoteCursor> establishCursors(
     OperationContext* opCtx,
     executor::TaskExecutor* executor,

@@ -147,6 +147,7 @@ private:
     long long _numReturnedSoFar = 0;
 
     // The root stage of the pipeline used to return the result set, merged from the remote nodes.
+    // SAM: merge results from different shards?
     std::unique_ptr<RouterExecStage> _root;
 
     // Stores documents queued by queueResult(). BSONObjs within the stashed results must be owned.

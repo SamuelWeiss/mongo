@@ -263,6 +263,8 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceASIO shutdown in progress"};
     }
 
+    // SAM: maybe check out what's in the request?
+    // Note: the request has a host an port field
     LOG(2) << "startCommand: " << redact(request.toString());
 
     auto getConnectionStartTime = now();

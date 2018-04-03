@@ -221,6 +221,7 @@ std::unique_ptr<RouterExecStage> createInitialStage(OperationContext* opCtx,
     }
 }
 
+// SAM: maybe this is what buildMergerPlan is doing???
 std::unique_ptr<RouterExecStage> buildPipelinePlan(executor::TaskExecutor* executor,
                                                    ClusterClientCursorParams* params) {
     invariant(params->mergePipeline);
@@ -256,6 +257,8 @@ std::unique_ptr<RouterExecStage> buildPipelinePlan(executor::TaskExecutor* execu
 }
 }  // namespace
 
+
+// SAM: ok so it is defined here?
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
     OperationContext* opCtx, executor::TaskExecutor* executor, ClusterClientCursorParams* params) {
     const auto skip = params->skip;

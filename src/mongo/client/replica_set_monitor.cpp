@@ -261,6 +261,7 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
     _refresherHandle = status.getValue();
 }
 
+// SAM: remote_command_targeter entry point
 StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
                                                             Milliseconds maxWait) {
     if (_isRemovedFromManager.load()) {
@@ -271,7 +272,7 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
     {
         // Fast path, for the failure-free case
         stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-        HostAndPort out = _state->getMatchingHost(criteria);
+        HostAndPort out = _state->getMatchingHost(criteria); // SAM: to modify 1
         if (!out.empty())
             return {std::move(out)};
     }
@@ -285,7 +286,7 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
         // function gives up.
         Refresher refresher(startOrContinueRefresh());
 
-        HostAndPort out = refresher.refreshUntilMatches(criteria);
+        HostAndPort out = refresher.refreshUntilMatches(criteria); // SAM: to modify 2
         if (!out.empty())
             return {std::move(out)};
 
@@ -810,6 +811,8 @@ void Refresher::receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply) {
     }
 }
 
+// SAM: it looks like this just calls in to getMatchingHost
+// means that I probably don't need to modify it
 HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteria) {
     stdx::unique_lock<stdx::mutex> lk(_set->mutex);
     while (true) {
@@ -1030,8 +1033,11 @@ SetState::SetState(const MongoURI& uri)
 }
 
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
+    // SAM: For now I'm just gonna hack this in a pretty basic way
+    // TODO: do more to make sure there are no collisions
     switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
+        case ReadPreference::DuplicatePrimary:
         case ReadPreference::PrimaryPreferred: {
             HostAndPort out =
                 getMatchingHost(ReadPreferenceSetting(ReadPreference::PrimaryOnly, criteria.tags));
@@ -1042,6 +1048,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
         }
 
+        case ReadPreference::DuplicateSecondary:
         case ReadPreference::SecondaryPreferred: {
             HostAndPort out = getMatchingHost(ReadPreferenceSetting(
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));

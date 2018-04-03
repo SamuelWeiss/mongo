@@ -171,6 +171,7 @@ boost::optional<AsyncRequestsSender::Response> AsyncRequestsSender::_ready() {
     return boost::none;
 }
 
+// SAM: here is where they actually check
 void AsyncRequestsSender::_scheduleRequests(WithLock lk) {
     invariant(!_stopRetrying);
     // Schedule remote work on hosts for which we have not sent a request or need to retry.
@@ -212,6 +213,7 @@ void AsyncRequestsSender::_scheduleRequests(WithLock lk) {
 
         // If the remote does not have a response or pending request, schedule remote work for it.
         if (!remote.swResponse && !remote.cbHandle.isValid()) {
+          // SAM: i is just the index here
             auto scheduleStatus = _scheduleRequest(lk, i);
             if (!scheduleStatus.isOK()) {
                 remote.swResponse = std::move(scheduleStatus);
@@ -232,6 +234,7 @@ Status AsyncRequestsSender::_scheduleRequest(WithLock, size_t remoteIndex) {
     invariant(!remote.cbHandle.isValid());
     invariant(!remote.swResponse);
 
+    // SAM: ayy, here we go!
     Status resolveStatus = remote.resolveShardIdToHostAndPort(_readPreference);
     if (!resolveStatus.isOK()) {
         return resolveStatus;
@@ -302,6 +305,8 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
                       str::stream() << "Could not find shard " << shardId);
     }
 
+    // SAM: idea: modify readPref so it can capture if it's a duplicate
+    // Then modify findHostWithMaxWait so it grabs the second option
     auto findHostStatus = shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20});
     if (!findHostStatus.isOK()) {
         return findHostStatus.getStatus();

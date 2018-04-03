@@ -46,6 +46,7 @@ namespace mongo {
 class CursorResponse;
 
 /**
+ * SAM: holy shit, selecting hosts herein
  * Establishes cursors on the remote shards by issuing requests in parallel, using the readPref to
  * select a host within each shard.
  *
@@ -68,5 +69,15 @@ std::vector<ClusterClientCursorParams::RemoteCursor> establishCursors(
     const ReadPreferenceSetting readPref,
     const std::vector<std::pair<ShardId, BSONObj>>& remotes,
     bool allowPartialResults);
+
+std::pair<std::vector<ClusterClientCursorParams::RemoteCursor>,
+          std::vector<ClusterClientCursorParams::RemoteCursor>> establishDualCursors(
+    OperationContext* opCtx,
+    executor::TaskExecutor* executor,
+    const NamespaceString& nss,
+    const ReadPreferenceSetting readPref,
+    const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+    bool allowPartialResults);
+
 
 }  // namespace mongo

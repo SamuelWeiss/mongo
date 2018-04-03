@@ -66,6 +66,17 @@ enum class ReadPreference {
      * Read from any member.
      */
     Nearest,
+
+    /**
+     * primary reads for duplicate reads.
+     */
+    DuplicatePrimary,
+
+    /**
+     * Secondary reads for duplicate reads.
+     */
+    DuplicateSecondary,
+
 };
 
 /**

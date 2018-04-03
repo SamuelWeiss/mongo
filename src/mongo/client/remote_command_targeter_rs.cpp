@@ -60,6 +60,7 @@ ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
+// SAM: host lookup entry point
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
     return _rsMonitor->getHostOrRefresh(readPref, maxWait);
