@@ -66,6 +66,11 @@ StatusWith<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
     return _rsMonitor->getHostOrRefresh(readPref, maxWait);
 }
 
+std::pair<HostAndPort,HostAndPort> RemoteCommandTargeterRS::getDualMatchingHosts(
+    const ReadPreferenceSetting& readPref) {
+    return _rsMonitor->getDualMatchingHosts(readPref);
+}
+
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
                                                           const ReadPreferenceSetting& readPref) {
     auto clock = opCtx->getServiceContext()->getFastClockSource();

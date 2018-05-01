@@ -79,6 +79,8 @@ public:
     virtual StatusWith<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
                                                         Milliseconds maxWait) = 0;
 
+    virtual std::pair<HostAndPort, HostAndPort> getDualMatchingHosts(const ReadPreferenceSetting& readPref) = 0;
+
     /**
      * Finds a host matching the given read preference, giving up if a match is not found promptly.
      *

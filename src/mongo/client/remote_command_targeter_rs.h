@@ -57,6 +57,7 @@ public:
 
     StatusWith<HostAndPort> findHostWithMaxWait(const ReadPreferenceSetting& readPref,
                                                 Milliseconds maxWait) override;
+    std::pair<HostAndPort, HostAndPort> getDualMatchingHosts(const ReadPreferenceSetting& readPref) override;
 
     void markHostNotMaster(const HostAndPort& host, const Status& status) override;
 

@@ -146,6 +146,16 @@ public:
 
     bool isUsable() const;
 
+
+    /**
+     * Convenience functions for DANS
+     */
+    HostAndPort getInitialHost();
+    HostAndPort getNewMatchingHost(const ReadPreferenceSetting& criteria,
+                                   const HostAndPort previousSelection);
+
+    std::pair<HostAndPort, HostAndPort> getDualMatchingHosts(const ReadPreferenceSetting& criteria);
+
     /**
      * Returns a host matching criteria or an empty host if no known host matches.
      *

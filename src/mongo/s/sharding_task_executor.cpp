@@ -32,6 +32,8 @@
 
 #include "mongo/s/sharding_task_executor.h"
 
+#include <future>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/timestamp.h"
@@ -110,9 +112,45 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(
     return _executor->scheduleWorkAt(when, work);
 }
 
+
+
+// SAM: new code, need to decide how to signal if it's a primary or secondary
+// also: one callback or two? I think one is actually the right way to go
+std::pair<bool, StatusWith<TaskExecutor::CallbackHandle>>
+    ShardingTaskExecutor::scheduleDANSRemoteCommand(
+        const RemoteCommandRequest& primaryRequest,
+        const RemoteCommandRequest& secondaryRequest,
+        const RemoteCommandCallbackFn& cb) {
+
+    // SAM: TODO: get the schedule remote command to bind correctly
+    // For now ripping this out I just want it to run
+    // auto res1 = std::async(std::launch::async,
+    //                        scheduleRemoteCommand,
+    //                        primaryRequest,
+    //                        cb);
+    // auto res2 = std::async(std::launch::async,
+    //                        scheduleRemoteCommand,
+    //                        secondaryRequest,
+    //                        cb);
+    //
+    // // SAM TODO: better checking?
+    // while (true) {
+    //   if (res1.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
+    //     return std::make_pair(true, res1.get());
+    //     // SAM TODO: freeing/killing
+    //   } else if (res2.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
+    //     return std::make_pair(false, res2.get());
+    //   }
+    // }
+    // ???
+    return std::make_pair(true, scheduleRemoteCommand(primaryRequest, cb));
+}
+
 // SAM: looks like a good place to start
 // This function just does some setup then calls scheduleRemoteCommand on the executor
-StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
+
+//SAM: added static to fix a compile thing, might break other stuff
+/*static*/ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
     const RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) {
 
     // schedule the user's callback if there is not opCtx
@@ -122,7 +160,7 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
 
     // SAM: relevant to what we saw in the network section, host and port is part
     // of this request
-    // But, we're also taking in a request so...  
+    // But, we're also taking in a request so...
     boost::optional<RemoteCommandRequest> newRequest;
 
     if (request.opCtx->getLogicalSessionId() && !request.cmdObj.hasField("lsid")) {

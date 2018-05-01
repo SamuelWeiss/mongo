@@ -88,15 +88,43 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
       _params(params),
       _mergeQueue(MergingComparator(_remotes, _params->sort, _params->compareWholeSortKey)) {
     size_t remoteIndex = 0;
-    for (const auto& remote : _params->remotes) {
-        _remotes.emplace_back(remote.hostAndPort,
-                              remote.cursorResponse.getNSS(),
-                              remote.cursorResponse.getCursorId());
 
-        // We don't check the return value of _addBatchToBuffer here; if there was an error,
-        // it will be stored in the remote and the first call to ready() will return true.
-        _addBatchToBuffer(WithLock::withoutLock(), remoteIndex, remote.cursorResponse);
-        ++remoteIndex;
+    isDANS = _params->isDANS;
+    if (_params->isDANS) {
+      // SAM: emplace some DANS cursors if necessary
+      for (const auto& DANSremote : _params->DANSRemotes) {
+          // actually need to build out a little data here
+          std::pair<NamespaceString,NamespaceString>
+              nsses(DANSremote.cursorResponses.first.getNSS(),
+                    DANSremote.cursorResponses.second.getNSS());
+
+          std::pair<CursorId, CursorId>
+              cids(DANSremote.cursorResponses.first.getCursorId(),
+                   DANSremote.cursorResponses.second.getCursorId());
+
+          //SAM: TODO: need to std::move?
+          _DANSremotes.emplace_back(DANSremote.DANSHostAndPorts, nsses, cids);
+
+          // We don't check the return value of _addBatchToBuffer here; if there was an error,
+          // it will be stored in the remote and the first call to ready() will return true.
+          _addBatchToBuffer(WithLock::withoutLock(), remoteIndex, DANSremote.cursorResponses.first);
+          _addBatchToBuffer(WithLock::withoutLock(), remoteIndex, DANSremote.cursorResponses.second);
+          ++remoteIndex;
+      }
+
+
+    } else {
+      // SAM: alright another move in the right direction
+      for (const auto& remote : _params->remotes) {
+          _remotes.emplace_back(remote.hostAndPort,
+                                remote.cursorResponse.getNSS(),
+                                remote.cursorResponse.getCursorId());
+
+          // We don't check the return value of _addBatchToBuffer here; if there was an error,
+          // it will be stored in the remote and the first call to ready() will return true.
+          _addBatchToBuffer(WithLock::withoutLock(), remoteIndex, remote.cursorResponse);
+          ++remoteIndex;
+      }
     }
 
     // Initialize command metadata to handle the read preference. We do this in case the readPref
@@ -117,16 +145,26 @@ bool AsyncResultsMerger::remotesExhausted() {
     return _remotesExhausted(lk);
 }
 
+// SAM: done
 bool AsyncResultsMerger::_remotesExhausted(WithLock) {
-    for (const auto& remote : _remotes) {
-        if (!remote.exhausted()) {
-            return false;
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (!remote.exhausted()) {
+                return false;
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (!remote.exhausted()) {
+                return false;
+            }
         }
     }
 
     return true;
 }
 
+//SAM done
 Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -140,9 +178,15 @@ Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     // recent optimes, which allows us to return sorted $changeStream results even if some shards
     // are yet to provide a batch of data. If the timeout specified by the client is greater than
     // 1000ms, then it will be enforced elsewhere.
-    _awaitDataTimeout = (!_params->sort.isEmpty() && _remotes.size() > 1u
-                             ? std::min(awaitDataTimeout, Milliseconds{1000})
-                             : awaitDataTimeout);
+    if (isDANS){
+        _awaitDataTimeout = (!_params->sort.isEmpty() && _DANSremotes.size() > 1u
+                                 ? std::min(awaitDataTimeout, Milliseconds{1000})
+                                 : awaitDataTimeout);
+    } else {
+        _awaitDataTimeout = (!_params->sort.isEmpty() && _remotes.size() > 1u
+                                 ? std::min(awaitDataTimeout, Milliseconds{1000})
+                                 : awaitDataTimeout);
+    }
 
     return Status::OK();
 }
@@ -168,9 +212,15 @@ void AsyncResultsMerger::reattachToOperationContext(OperationContext* opCtx) {
     _opCtx = opCtx;
 }
 
+// SAM: TODO: error stuff
 void AsyncResultsMerger::addNewShardCursors(
     const std::vector<ClusterClientCursorParams::RemoteCursor>& newCursors) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    //SAM: if the current result merger is doing DANS stuff we should error
+    // Might actually not be the right approach though, maybe fallback?
+
+
     for (auto&& remote : newCursors) {
         _remotes.emplace_back(remote.hostAndPort,
                               remote.cursorResponse.getNSS(),
@@ -178,6 +228,25 @@ void AsyncResultsMerger::addNewShardCursors(
     }
 }
 
+// SAM: TODO: more checking here
+void AsyncResultsMerger::addNewShardCursors(
+    const std::vector<ClusterClientCursorParams::DANSRemoteCursor>& newCursors) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    for (auto&& DANSremote : newCursors) {
+        std::pair<NamespaceString,NamespaceString>
+            nsses(DANSremote.cursorResponses.first.getNSS(),
+                  DANSremote.cursorResponses.second.getNSS());
+
+        std::pair<CursorId, CursorId>
+            cids(DANSremote.cursorResponses.first.getCursorId(),
+                 DANSremote.cursorResponses.second.getCursorId());
+
+        //SAM: TODO: need to std::move?
+        _DANSremotes.emplace_back(DANSremote.DANSHostAndPorts, nsses, cids);
+    }
+}
+
+//SAM done
 bool AsyncResultsMerger::_ready(WithLock lk) {
     if (_lifecycleState != kAlive) {
         return true;
@@ -189,11 +258,22 @@ bool AsyncResultsMerger::_ready(WithLock lk) {
         return true;
     }
 
-    for (const auto& remote : _remotes) {
-        // First check whether any of the remotes reported an error.
-        if (!remote.status.isOK()) {
-            _status = remote.status;
-            return true;
+
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            // First check whether any of the remotes reported an error.
+            if (!remote.status.isOK()) {
+                _status = remote.status;
+                return true;
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            // First check whether any of the remotes reported an error.
+            if (!remote.status.isOK()) {
+                _status = remote.status;
+                return true;
+            }
         }
     }
 
@@ -201,6 +281,7 @@ bool AsyncResultsMerger::_ready(WithLock lk) {
     return hasSort ? _readySorted(lk) : _readyUnsorted(lk);
 }
 
+// SAM done
 bool AsyncResultsMerger::_readySorted(WithLock lk) {
     if (_params->tailableMode == TailableMode::kTailableAndAwaitData) {
         return _readySortedTailable(lk);
@@ -208,53 +289,95 @@ bool AsyncResultsMerger::_readySorted(WithLock lk) {
     // Tailable non-awaitData cursors cannot have a sort.
     invariant(_params->tailableMode == TailableMode::kNormal);
 
-    for (const auto& remote : _remotes) {
-        if (!remote.hasNext() && !remote.exhausted()) {
-            return false;
+
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (!remote.hasNext() && !remote.exhausted()) {
+                return false;
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (!remote.hasNext() && !remote.exhausted()) {
+                return false;
+            }
         }
     }
 
     return true;
 }
+
 
 bool AsyncResultsMerger::_readySortedTailable(WithLock) {
     if (_mergeQueue.empty()) {
         return false;
     }
 
-    auto smallestRemote = _mergeQueue.top();
-    auto smallestResult = _remotes[smallestRemote].docBuffer.front();
-    auto keyWeWantToReturn =
-        extractSortKey(*smallestResult.getResult(), _params->compareWholeSortKey);
-    for (const auto& remote : _remotes) {
-        if (!remote.promisedMinSortKey) {
-            // In order to merge sorted tailable cursors, we need this value to be populated.
-            return false;
+    if (isDANS) {
+        auto smallestRemote = _mergeQueue.top();
+        auto smallestResult = _DANSremotes[smallestRemote].docBuffer.front();
+        auto keyWeWantToReturn =
+            extractSortKey(*smallestResult.getResult(), _params->compareWholeSortKey);
+        for (const auto& remote : _DANSremotes) {
+            if (!remote.promisedMinSortKey) {
+                // In order to merge sorted tailable cursors, we need this value to be populated.
+                return false;
+            }
+            if (compareSortKeys(keyWeWantToReturn, *remote.promisedMinSortKey, _params->sort) > 0) {
+                // The key we want to return is not guaranteed to be smaller than future results from
+                // this remote, so we can't yet return it.
+                return false;
+            }
         }
-        if (compareSortKeys(keyWeWantToReturn, *remote.promisedMinSortKey, _params->sort) > 0) {
-            // The key we want to return is not guaranteed to be smaller than future results from
-            // this remote, so we can't yet return it.
-            return false;
+    } else {
+        auto smallestRemote = _mergeQueue.top();
+        auto smallestResult = _remotes[smallestRemote].docBuffer.front();
+        auto keyWeWantToReturn =
+            extractSortKey(*smallestResult.getResult(), _params->compareWholeSortKey);
+        for (const auto& remote : _remotes) {
+            if (!remote.promisedMinSortKey) {
+                // In order to merge sorted tailable cursors, we need this value to be populated.
+                return false;
+            }
+            if (compareSortKeys(keyWeWantToReturn, *remote.promisedMinSortKey, _params->sort) > 0) {
+                // The key we want to return is not guaranteed to be smaller than future results from
+                // this remote, so we can't yet return it.
+                return false;
+            }
         }
-    }
+      }
     return true;
 }
 
+// SAM done
 bool AsyncResultsMerger::_readyUnsorted(WithLock) {
     bool allExhausted = true;
-    for (const auto& remote : _remotes) {
-        if (!remote.exhausted()) {
-            allExhausted = false;
-        }
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (!remote.exhausted()) {
+                allExhausted = false;
+            }
 
-        if (remote.hasNext()) {
-            return true;
+            if (remote.hasNext()) {
+                return true;
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (!remote.exhausted()) {
+                allExhausted = false;
+            }
+
+            if (remote.hasNext()) {
+                return true;
+            }
         }
     }
 
     return allExhausted;
 }
 
+// SAM nothing to do
 StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     dassert(_ready(lk));
@@ -275,6 +398,7 @@ StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
     return hasSort ? _nextReadySorted(lk) : _nextReadyUnsorted(lk);
 }
 
+//SAM done
 ClusterQueryResult AsyncResultsMerger::_nextReadySorted(WithLock) {
     // Tailable non-awaitData cursors cannot have a sort.
     invariant(_params->tailableMode != TailableMode::kTailable);
@@ -286,88 +410,217 @@ ClusterQueryResult AsyncResultsMerger::_nextReadySorted(WithLock) {
     size_t smallestRemote = _mergeQueue.top();
     _mergeQueue.pop();
 
-    invariant(!_remotes[smallestRemote].docBuffer.empty());
-    invariant(_remotes[smallestRemote].status.isOK());
+    ClusterQueryResult front;
 
-    ClusterQueryResult front = _remotes[smallestRemote].docBuffer.front();
-    _remotes[smallestRemote].docBuffer.pop();
+    if (isDANS) {
+        invariant(!_DANSremotes[smallestRemote].docBuffer.empty());
+        invariant(_DANSremotes[smallestRemote].status.isOK());
 
-    // Re-populate the merging queue with the next result from 'smallestRemote', if it has a
-    // next result.
-    if (!_remotes[smallestRemote].docBuffer.empty()) {
-        _mergeQueue.push(smallestRemote);
+
+        front = _DANSremotes[smallestRemote].docBuffer.front();
+        _DANSremotes[smallestRemote].docBuffer.pop();
+
+        // Re-populate the merging queue with the next result from 'smallestRemote', if it has a
+        // next result.
+        if (!_DANSremotes[smallestRemote].docBuffer.empty()) {
+            _mergeQueue.push(smallestRemote);
+        }
+    } else {
+        invariant(!_remotes[smallestRemote].docBuffer.empty());
+        invariant(_remotes[smallestRemote].status.isOK());
+
+        front = _remotes[smallestRemote].docBuffer.front();
+        _remotes[smallestRemote].docBuffer.pop();
+
+        // Re-populate the merging queue with the next result from 'smallestRemote', if it has a
+        // next result.
+        if (!_remotes[smallestRemote].docBuffer.empty()) {
+            _mergeQueue.push(smallestRemote);
+        }
     }
 
     return front;
 }
 
+// SAM done
 ClusterQueryResult AsyncResultsMerger::_nextReadyUnsorted(WithLock) {
     size_t remotesAttempted = 0;
-    while (remotesAttempted < _remotes.size()) {
-        // It is illegal to call this method if there is an error received from any shard.
-        invariant(_remotes[_gettingFromRemote].status.isOK());
+    if (isDANS) {
+        while (remotesAttempted < _DANSremotes.size()) {
+            // It is illegal to call this method if there is an error received from any shard.
+            invariant(_DANSremotes[_gettingFromRemote].status.isOK());
 
-        if (_remotes[_gettingFromRemote].hasNext()) {
-            ClusterQueryResult front = _remotes[_gettingFromRemote].docBuffer.front();
-            _remotes[_gettingFromRemote].docBuffer.pop();
+            if (_DANSremotes[_gettingFromRemote].hasNext()) {
+                ClusterQueryResult front = _DANSremotes[_gettingFromRemote].docBuffer.front();
+                _DANSremotes[_gettingFromRemote].docBuffer.pop();
 
-            if (_params->tailableMode == TailableMode::kTailable &&
-                !_remotes[_gettingFromRemote].hasNext()) {
-                // The cursor is tailable and we're about to return the last buffered result. This
-                // means that the next value returned should be boost::none to indicate the end of
-                // the batch.
-                _eofNext = true;
+                if (_params->tailableMode == TailableMode::kTailable &&
+                    !_DANSremotes[_gettingFromRemote].hasNext()) {
+                    // The cursor is tailable and we're about to return the last buffered result. This
+                    // means that the next value returned should be boost::none to indicate the end of
+                    // the batch.
+                    _eofNext = true;
+                }
+
+                return front;
             }
 
-            return front;
+            // Nothing from the current remote so move on to the next one.
+            ++remotesAttempted;
+            if (++_gettingFromRemote == _DANSremotes.size()) {
+                _gettingFromRemote = 0;
+            }
         }
+    } else {
+        while (remotesAttempted < _remotes.size()) {
+            // It is illegal to call this method if there is an error received from any shard.
+            invariant(_remotes[_gettingFromRemote].status.isOK());
 
-        // Nothing from the current remote so move on to the next one.
-        ++remotesAttempted;
-        if (++_gettingFromRemote == _remotes.size()) {
-            _gettingFromRemote = 0;
+            if (_remotes[_gettingFromRemote].hasNext()) {
+                ClusterQueryResult front = _remotes[_gettingFromRemote].docBuffer.front();
+                _remotes[_gettingFromRemote].docBuffer.pop();
+
+                if (_params->tailableMode == TailableMode::kTailable &&
+                    !_remotes[_gettingFromRemote].hasNext()) {
+                    // The cursor is tailable and we're about to return the last buffered result. This
+                    // means that the next value returned should be boost::none to indicate the end of
+                    // the batch.
+                    _eofNext = true;
+                }
+
+                return front;
+            }
+
+            // Nothing from the current remote so move on to the next one.
+            ++remotesAttempted;
+            if (++_gettingFromRemote == _remotes.size()) {
+                _gettingFromRemote = 0;
+            }
         }
     }
 
     return {};
 }
 
+// SAM: done ish
 Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
-    auto& remote = _remotes[remoteIndex];
+    if (isDANS) {
+        auto& remote = _DANSremotes[remoteIndex];
 
-    invariant(!remote.cbHandle.isValid());
+        // SAM check both
+        invariant(!remote.cbHandle.first.isValid());
+        invariant(!remote.cbHandle.second.isValid());
 
-    // If mongod returned less docs than the requested batchSize then modify the next getMore
-    // request to fetch the remaining docs only. If the remote node has a plan with OR for top k and
-    // a full sort as is the case for the OP_QUERY find then this optimization will prevent
-    // switching to the full sort plan branch.
-    auto adjustedBatchSize = _params->batchSize;
-    if (_params->batchSize && *_params->batchSize > remote.fetchedCount) {
-        adjustedBatchSize = *_params->batchSize - remote.fetchedCount;
+        // If mongod returned less docs than the requested batchSize then modify the next getMore
+        // request to fetch the remaining docs only. If the remote node has a plan with OR for top k and
+        // a full sort as is the case for the OP_QUERY find then this optimization will prevent
+        // switching to the full sort plan branch.
+        auto adjustedBatchSize = _params->batchSize;
+        if (_params->batchSize && *_params->batchSize > remote.fetchedCount) {
+            adjustedBatchSize = *_params->batchSize - remote.fetchedCount;
+        }
+
+        // make two different commants?
+        BSONObj cmdOb1 = GetMoreRequest(remote.cursorNss.first,
+                                        remote.cursorId.first,
+                                        adjustedBatchSize,
+                                        _awaitDataTimeout,
+                                        boost::none,
+                                        boost::none)
+                             .toBSON();
+
+         BSONObj cmdOb2 = GetMoreRequest(remote.cursorNss.second,
+                                         remote.cursorId.second,
+                                         adjustedBatchSize,
+                                         _awaitDataTimeout,
+                                         boost::none,
+                                         boost::none)
+                              .toBSON();
+
+        executor::RemoteCommandRequest primaryRequest(
+            remote.getFirstTargetHost(), _params->nsString.db().toString(), cmdOb1, _metadataObj, _opCtx);
+
+        executor::RemoteCommandRequest secondaryRequest(
+            remote.getSecondTargetHost(), _params->nsString.db().toString(), cmdOb2, _metadataObj, _opCtx);
+
+        // I need to remember to structure of this:
+        // is this even right? Am I losing my mind????
+        // std::pair<bool, mongo::StatusWith<mongo::executor::TaskExecutor::CallbackHandle> >
+        std::pair<bool, mongo::StatusWith<mongo::executor::TaskExecutor::CallbackHandle> > callbackStatusPair =
+            _executor->scheduleDANSRemoteCommand(primaryRequest, secondaryRequest,
+                [this, remoteIndex](auto const& cbData) {
+                    stdx::lock_guard<stdx::mutex> lk(this->_mutex);
+                      this->_handleBatchResponse(lk, cbData, remoteIndex);
+            });
+
+
+        // check which one returned then check that callback status
+        if (callbackStatusPair.first) {
+          if (callbackStatusPair.second.isOK()) {
+            // remote.cbHandle = callbackStatusPair.second.first.getValue();
+            remote.cbHandle.first = callbackStatusPair.second.getValue();
+
+          } else {
+            return callbackStatusPair.second.getStatus();
+          }
+
+        } else {
+          if (callbackStatusPair.second.isOK()) {
+            // not the bool, the second
+            // remote.cbHandle = callbackStatusPair.second.second.getValue();
+            remote.cbHandle.second = callbackStatusPair.second.getValue();
+          } else {
+            return callbackStatusPair.second.getStatus();
+          }
+
+        }
+
+        // SAM : TODO: make determination about primary or secondary based on the first item of the make_pair
+        // if (callbackStatusPair.first) { // isPrimary
+        //     // cancel the second host and port?
+        //
+        // } else {
+        //
+        // }
+        // remote.cbHandle = callbackStatusPair.first.getValue();
+
+    } else {
+        auto& remote = _remotes[remoteIndex];
+
+        invariant(!remote.cbHandle.isValid());
+
+        // If mongod returned less docs than the requested batchSize then modify the next getMore
+        // request to fetch the remaining docs only. If the remote node has a plan with OR for top k and
+        // a full sort as is the case for the OP_QUERY find then this optimization will prevent
+        // switching to the full sort plan branch.
+        auto adjustedBatchSize = _params->batchSize;
+        if (_params->batchSize && *_params->batchSize > remote.fetchedCount) {
+            adjustedBatchSize = *_params->batchSize - remote.fetchedCount;
+        }
+
+        BSONObj cmdObj = GetMoreRequest(remote.cursorNss,
+                                        remote.cursorId,
+                                        adjustedBatchSize,
+                                        _awaitDataTimeout,
+                                        boost::none,
+                                        boost::none)
+                             .toBSON();
+
+        executor::RemoteCommandRequest request(
+            remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, _metadataObj, _opCtx);
+
+        auto callbackStatus =
+            _executor->scheduleRemoteCommand(request, [this, remoteIndex](auto const& cbData) {
+                stdx::lock_guard<stdx::mutex> lk(this->_mutex);
+                this->_handleBatchResponse(lk, cbData, remoteIndex);
+            });
+
+        if (!callbackStatus.isOK()) {
+            return callbackStatus.getStatus();
+        }
+
+        remote.cbHandle = callbackStatus.getValue();
     }
-
-    BSONObj cmdObj = GetMoreRequest(remote.cursorNss,
-                                    remote.cursorId,
-                                    adjustedBatchSize,
-                                    _awaitDataTimeout,
-                                    boost::none,
-                                    boost::none)
-                         .toBSON();
-
-    executor::RemoteCommandRequest request(
-        remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, _metadataObj, _opCtx);
-
-    auto callbackStatus =
-        _executor->scheduleRemoteCommand(request, [this, remoteIndex](auto const& cbData) {
-            stdx::lock_guard<stdx::mutex> lk(this->_mutex);
-            this->_handleBatchResponse(lk, cbData, remoteIndex);
-        });
-
-    if (!callbackStatus.isOK()) {
-        return callbackStatus.getStatus();
-    }
-
-    remote.cbHandle = callbackStatus.getValue();
     return Status::OK();
 }
 
@@ -379,6 +632,7 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
  * 2. Remotes that already has some result will have a non-empty buffer.
  * 3. Remotes that reached maximum retries will be in 'exhausted' state.
  */
+ //SAM done
 StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -396,19 +650,38 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     }
 
     // Schedule remote work on hosts for which we need more results.
-    for (size_t i = 0; i < _remotes.size(); ++i) {
-        auto& remote = _remotes[i];
+    if (isDANS) {
+        for (size_t i = 0; i < _DANSremotes.size(); ++i) {
+            auto& remote = _DANSremotes[i];
 
-        if (!remote.status.isOK()) {
-            return remote.status;
+            if (!remote.status.isOK()) {
+                return remote.status;
+            }
+
+            if (!remote.hasNext() && !remote.exhausted() && (!remote.cbHandle.first.isValid() || !remote.cbHandle.second.isValid())) {
+                // If this remote is not exhausted and there is no outstanding request for it, schedule
+                // work to retrieve the next batch.
+                auto nextBatchStatus = _askForNextBatch(lk, i);
+                if (!nextBatchStatus.isOK()) {
+                    return nextBatchStatus;
+                }
+            }
         }
+    } else {
+        for (size_t i = 0; i < _remotes.size(); ++i) {
+            auto& remote = _remotes[i];
 
-        if (!remote.hasNext() && !remote.exhausted() && !remote.cbHandle.isValid()) {
-            // If this remote is not exhausted and there is no outstanding request for it, schedule
-            // work to retrieve the next batch.
-            auto nextBatchStatus = _askForNextBatch(lk, i);
-            if (!nextBatchStatus.isOK()) {
-                return nextBatchStatus;
+            if (!remote.status.isOK()) {
+                return remote.status;
+            }
+
+            if (!remote.hasNext() && !remote.exhausted() && !remote.cbHandle.isValid()) {
+                // If this remote is not exhausted and there is no outstanding request for it, schedule
+                // work to retrieve the next batch.
+                auto nextBatchStatus = _askForNextBatch(lk, i);
+                if (!nextBatchStatus.isOK()) {
+                    return nextBatchStatus;
+                }
             }
         }
     }
@@ -428,6 +701,7 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     return eventToReturn;
 }
 
+// SAM don't modify
 StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
     const BSONObj& responseObj, const RemoteCursorData& remote) {
 
@@ -444,6 +718,42 @@ StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Expected cursorid " << remote.cursorId << " but received "
                                     << cursorResponse.getCursorId());
+    }
+
+    return std::move(cursorResponse);
+}
+
+// SAM new code
+StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
+    const BSONObj& responseObj, const DANSRemoteCursorData& remote) {
+
+    auto getMoreParseStatus = CursorResponse::parseFromBSON(responseObj);
+    if (!getMoreParseStatus.isOK()) {
+        return getMoreParseStatus.getStatus();
+    }
+
+    auto cursorResponse = std::move(getMoreParseStatus.getValue());
+
+    // If we get a non-zero cursor id that is not equal to the established cursor id, we will fail
+    // the operation.
+
+
+    bool validCursorId = false;
+    // use the cursor id from the response to figure out which one it is
+    // if they're the same... well that's a problem
+    if (remote.cursorId.first == cursorResponse.getCursorId()) {
+        validCursorId = true;
+        cursorResponse.isPrimary = true;
+    } else if (remote.cursorId.second == cursorResponse.getCursorId()) {
+        validCursorId = true;
+        cursorResponse.isPrimary = false;
+    } // SAM: else should really error here
+
+    if (!validCursorId) {
+      return Status(ErrorCodes::BadValue,
+                    str::stream() << "Expected cursorid " << remote.cursorId.first << " or "
+                                  << remote.cursorId.second << " but received "
+                                  << cursorResponse.getCursorId());
     }
 
     return std::move(cursorResponse);
@@ -492,11 +802,65 @@ void AsyncResultsMerger::updateRemoteMetadata(RemoteCursorData* remote,
     }
 }
 
+// SAM yikes, not 100% sure what to do here
+void AsyncResultsMerger::updateRemoteMetadata(DANSRemoteCursorData* remote,
+                                              const CursorResponse& response) {
+    // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
+    // SAM: TODO: this might not be the right thing to do!
+    if (response.isPrimary) {
+        remote->cursorId.first = response.getCursorId();
+    } else {
+        remote->cursorId.second = response.getCursorId();
+    }
+    if (response.getLastOplogTimestamp() && !response.getLastOplogTimestamp()->isNull()) {
+        // We only expect to see this for change streams.
+        invariant(SimpleBSONObjComparator::kInstance.evaluate(_params->sort ==
+                                                              change_stream_constants::kSortSpec));
+
+        auto newLatestTimestamp = *response.getLastOplogTimestamp();
+        if (remote->promisedMinSortKey) {
+            auto existingLatestTimestamp = remote->promisedMinSortKey->firstElement().timestamp();
+            if (existingLatestTimestamp == newLatestTimestamp) {
+                // Nothing to update.
+                return;
+            }
+            // The most recent oplog timestamp should never be smaller than the timestamp field of
+            // the previous min sort key for this remote, if one exists.
+            invariant(existingLatestTimestamp < newLatestTimestamp);
+        }
+
+        // Our new minimum promised sort key is the first key whose timestamp matches the most
+        // recent reported oplog timestamp.
+        auto newPromisedMin =
+            BSON("" << *response.getLastOplogTimestamp() << "" << MINKEY << "" << MINKEY);
+
+        // The promised min sort key should never be smaller than any results returned. If the
+        // last entry in the batch is also the most recent entry in the oplog, then its sort key
+        // of {lastOplogTimestamp, uuid, docID} will be greater than the artificial promised min
+        // sort key of {lastOplogTimestamp, MINKEY, MINKEY}.
+        auto maxSortKeyFromResponse =
+            (response.getBatch().empty()
+                 ? BSONObj()
+                 : extractSortKey(response.getBatch().back(), _params->compareWholeSortKey));
+
+        remote->promisedMinSortKey =
+            (compareSortKeys(
+                 newPromisedMin, maxSortKeyFromResponse, change_stream_constants::kSortSpec) < 0
+                 ? maxSortKeyFromResponse.getOwned()
+                 : newPromisedMin.getOwned());
+    }
+}
+
+//SAM done
 void AsyncResultsMerger::_handleBatchResponse(WithLock lk,
                                               CbData const& cbData,
                                               size_t remoteIndex) {
     // Got a response from remote, so indicate we are no longer waiting for one.
-    _remotes[remoteIndex].cbHandle = executor::TaskExecutor::CallbackHandle();
+    if (isDANS) {
+        _DANSremotes[remoteIndex].cbHandle = std::make_pair(executor::TaskExecutor::CallbackHandle(), executor::TaskExecutor::CallbackHandle());
+    } else {
+        _remotes[remoteIndex].cbHandle = executor::TaskExecutor::CallbackHandle();
+    }
 
     //  On shutdown, there is no need to process the response.
     if (_lifecycleState != kAlive) {
@@ -507,7 +871,11 @@ void AsyncResultsMerger::_handleBatchResponse(WithLock lk,
     try {
         _processBatchResults(lk, cbData.response, remoteIndex);
     } catch (DBException const& e) {
-        _remotes[remoteIndex].status = e.toStatus();
+        if (isDANS) {
+            _DANSremotes[remoteIndex].status = e.toStatus();
+        } else {
+            _remotes[remoteIndex].status = e.toStatus();
+        }
     }
     _signalCurrentEventIfReady(lk);  // Wake up anyone waiting on '_currentEvent'.
 }
@@ -527,100 +895,193 @@ void AsyncResultsMerger::_cleanUpKilledBatch(WithLock lk) {
     }
 }
 
+// SAM done maybe
 void AsyncResultsMerger::_cleanUpFailedBatch(WithLock lk, Status status, size_t remoteIndex) {
-    auto& remote = _remotes[remoteIndex];
-    remote.status = std::move(status);
-    // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
-    // remove the unreachable host entirely from consideration by marking it as exhausted.
-    if (_params->isAllowPartialResults) {
-        remote.status = Status::OK();
+    if (isDANS) {
+        auto& remote = _DANSremotes[remoteIndex];
+        remote.status = std::move(status);
+        // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
+        // remove the unreachable host entirely from consideration by marking it as exhausted.
+        if (_params->isAllowPartialResults) {
+            remote.status = Status::OK();
 
-        // Clear the results buffer and cursor id.
-        std::queue<ClusterQueryResult> emptyBuffer;
-        std::swap(remote.docBuffer, emptyBuffer);
-        remote.cursorId = 0;
+            // Clear the results buffer and cursor id.
+            std::queue<ClusterQueryResult> emptyBuffer;
+            std::swap(remote.docBuffer, emptyBuffer);
+            remote.cursorId = std::make_pair(0,0);
+        }
+    } else {
+        auto& remote = _remotes[remoteIndex];
+        remote.status = std::move(status);
+        // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
+        // remove the unreachable host entirely from consideration by marking it as exhausted.
+        if (_params->isAllowPartialResults) {
+            remote.status = Status::OK();
+
+            // Clear the results buffer and cursor id.
+            std::queue<ClusterQueryResult> emptyBuffer;
+            std::swap(remote.docBuffer, emptyBuffer);
+            remote.cursorId = 0;
+        }
     }
 }
 
+// SAM done ish
 void AsyncResultsMerger::_processBatchResults(WithLock lk,
                                               CbResponse const& response,
                                               size_t remoteIndex) {
-    auto& remote = _remotes[remoteIndex];
+
     if (!response.isOK()) {
         _cleanUpFailedBatch(lk, response.status, remoteIndex);
         return;
     }
-    auto cursorResponseStatus = _parseCursorResponse(response.data, remote);
-    if (!cursorResponseStatus.isOK()) {
-        _cleanUpFailedBatch(lk, cursorResponseStatus.getStatus(), remoteIndex);
-        return;
-    }
+    if (isDANS) {
+        auto& remote = _DANSremotes[remoteIndex];
+        // SAM: do I need to do anything here?
+        auto cursorResponseStatus = _parseCursorResponse(response.data, remote);
+        if (!cursorResponseStatus.isOK()) {
+            _cleanUpFailedBatch(lk, cursorResponseStatus.getStatus(), remoteIndex);
+            return;
+        }
 
-    CursorResponse cursorResponse = std::move(cursorResponseStatus.getValue());
+        CursorResponse cursorResponse = std::move(cursorResponseStatus.getValue());
 
-    // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
-    remote.cursorId = cursorResponse.getCursorId();
+        if (cursorResponse.isPrimary) {
+            remote.cursorId.first = cursorResponse.getCursorId();
+        } else {
+            remote.cursorId.second = cursorResponse.getCursorId();
+        }
 
-    // Save the batch in the remote's buffer.
-    if (!_addBatchToBuffer(lk, remoteIndex, cursorResponse)) {
-        return;
-    }
+        // Save the batch in the remote's buffer.
+        if (!_addBatchToBuffer(lk, remoteIndex, cursorResponse)) {
+            return;
+        }
+        // If the cursor is tailable and we just received an empty batch, the next return value should
+        // be boost::none in order to indicate the end of the batch. We do not ask for the next batch if
+        // the cursor is tailable, as batches received from remote tailable cursors should be passed
+        // through to the client as-is.
+        // (Note: tailable cursors are only valid on unsharded collections, so the end of the batch from
+        // one shard means the end of the overall batch).
+        if (_params->tailableMode == TailableMode::kTailable && !remote.hasNext()) {
+            invariant(_remotes.size() == 1);
+            _eofNext = true;
+        } else if (!remote.hasNext() && !remote.exhausted() && _lifecycleState == kAlive) {
+            // If this is normal or tailable-awaitData cursor and we still don't have anything buffered
+            // after receiving this batch, we can schedule work to retrieve the next batch right away.
+            remote.status = _askForNextBatch(lk, remoteIndex);
+        }
 
-    // If the cursor is tailable and we just received an empty batch, the next return value should
-    // be boost::none in order to indicate the end of the batch. We do not ask for the next batch if
-    // the cursor is tailable, as batches received from remote tailable cursors should be passed
-    // through to the client as-is.
-    // (Note: tailable cursors are only valid on unsharded collections, so the end of the batch from
-    // one shard means the end of the overall batch).
-    if (_params->tailableMode == TailableMode::kTailable && !remote.hasNext()) {
-        invariant(_remotes.size() == 1);
-        _eofNext = true;
-    } else if (!remote.hasNext() && !remote.exhausted() && _lifecycleState == kAlive) {
-        // If this is normal or tailable-awaitData cursor and we still don't have anything buffered
-        // after receiving this batch, we can schedule work to retrieve the next batch right away.
-        remote.status = _askForNextBatch(lk, remoteIndex);
+    } else {
+        auto& remote = _remotes[remoteIndex];
+        // SAM: do I need to do anything here?
+        auto cursorResponseStatus = _parseCursorResponse(response.data, remote);
+        if (!cursorResponseStatus.isOK()) {
+            _cleanUpFailedBatch(lk, cursorResponseStatus.getStatus(), remoteIndex);
+            return;
+        }
+
+        CursorResponse cursorResponse = std::move(cursorResponseStatus.getValue());
+        remote.cursorId = cursorResponse.getCursorId();
+        // Save the batch in the remote's buffer.
+        if (!_addBatchToBuffer(lk, remoteIndex, cursorResponse)) {
+            return;
+        }
+        // If the cursor is tailable and we just received an empty batch, the next return value should
+        // be boost::none in order to indicate the end of the batch. We do not ask for the next batch if
+        // the cursor is tailable, as batches received from remote tailable cursors should be passed
+        // through to the client as-is.
+        // (Note: tailable cursors are only valid on unsharded collections, so the end of the batch from
+        // one shard means the end of the overall batch).
+        if (_params->tailableMode == TailableMode::kTailable && !remote.hasNext()) {
+            invariant(_remotes.size() == 1);
+            _eofNext = true;
+        } else if (!remote.hasNext() && !remote.exhausted() && _lifecycleState == kAlive) {
+            // If this is normal or tailable-awaitData cursor and we still don't have anything buffered
+            // after receiving this batch, we can schedule work to retrieve the next batch right away.
+            remote.status = _askForNextBatch(lk, remoteIndex);
+        }
     }
 }
 
+// sam i don't know here -> so I didn't do anything useful, great
 bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                                            size_t remoteIndex,
                                            const CursorResponse& response) {
-    auto& remote = _remotes[remoteIndex];
-    updateRemoteMetadata(&remote, response);
-    for (const auto& obj : response.getBatch()) {
-        // If there's a sort, we're expecting the remote node to have given us back a sort key.
-        if (!_params->sort.isEmpty()) {
-            auto key = obj[AsyncResultsMerger::kSortKeyField];
-            if (!key) {
-                remote.status =
-                    Status(ErrorCodes::InternalError,
-                           str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' in document: "
-                                         << obj);
-                return false;
-            } else if (!_params->compareWholeSortKey && key.type() != BSONType::Object) {
-                remote.status =
-                    Status(ErrorCodes::InternalError,
-                           str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
-                                         << "' was not of type Object in document: "
-                                         << obj);
-                return false;
+    if (isDANS) {
+        auto& remote = _DANSremotes[remoteIndex];
+        updateRemoteMetadata(&remote, response);
+        for (const auto& obj : response.getBatch()) {
+            // If there's a sort, we're expecting the remote node to have given us back a sort key.
+            if (!_params->sort.isEmpty()) {
+                auto key = obj[AsyncResultsMerger::kSortKeyField];
+                if (!key) {
+                    remote.status =
+                        Status(ErrorCodes::InternalError,
+                               str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
+                                             << "' in document: "
+                                             << obj);
+                    return false;
+                } else if (!_params->compareWholeSortKey && key.type() != BSONType::Object) {
+                    remote.status =
+                        Status(ErrorCodes::InternalError,
+                               str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
+                                             << "' was not of type Object in document: "
+                                             << obj);
+                    return false;
+                }
             }
+
+            ClusterQueryResult result(obj);
+            remote.docBuffer.push(result);
+            ++remote.fetchedCount;
         }
 
-        ClusterQueryResult result(obj);
-        remote.docBuffer.push(result);
-        ++remote.fetchedCount;
+        // If we're doing a sorted merge, then we have to make sure to put this remote onto the
+        // merge queue.
+        if (!_params->sort.isEmpty() && !response.getBatch().empty()) {
+            _mergeQueue.push(remoteIndex);
+        }
+        return true;
+    } else {
+        auto& remote = _remotes[remoteIndex];
+        updateRemoteMetadata(&remote, response);
+        for (const auto& obj : response.getBatch()) {
+            // If there's a sort, we're expecting the remote node to have given us back a sort key.
+            if (!_params->sort.isEmpty()) {
+                auto key = obj[AsyncResultsMerger::kSortKeyField];
+                if (!key) {
+                    remote.status =
+                        Status(ErrorCodes::InternalError,
+                               str::stream() << "Missing field '" << AsyncResultsMerger::kSortKeyField
+                                             << "' in document: "
+                                             << obj);
+                    return false;
+                } else if (!_params->compareWholeSortKey && key.type() != BSONType::Object) {
+                    remote.status =
+                        Status(ErrorCodes::InternalError,
+                               str::stream() << "Field '" << AsyncResultsMerger::kSortKeyField
+                                             << "' was not of type Object in document: "
+                                             << obj);
+                    return false;
+                }
+            }
+
+            ClusterQueryResult result(obj);
+            remote.docBuffer.push(result);
+            ++remote.fetchedCount;
+        }
+
+        // If we're doing a sorted merge, then we have to make sure to put this remote onto the
+        // merge queue.
+        if (!_params->sort.isEmpty() && !response.getBatch().empty()) {
+            _mergeQueue.push(remoteIndex);
+        }
+        return true;
     }
 
-    // If we're doing a sorted merge, then we have to make sure to put this remote onto the
-    // merge queue.
-    if (!_params->sort.isEmpty() && !response.getBatch().empty()) {
-        _mergeQueue.push(remoteIndex);
-    }
-    return true;
 }
 
+//SAM nothing to do here
 void AsyncResultsMerger::_signalCurrentEventIfReady(WithLock lk) {
     if (_ready(lk) && _currentEvent.isValid()) {
         // To prevent ourselves from signalling the event twice, we set '_currentEvent' as
@@ -630,32 +1091,66 @@ void AsyncResultsMerger::_signalCurrentEventIfReady(WithLock lk) {
     }
 }
 
+//SAM done
 bool AsyncResultsMerger::_haveOutstandingBatchRequests(WithLock) {
-    for (const auto& remote : _remotes) {
-        if (remote.cbHandle.isValid()) {
-            return true;
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (remote.cbHandle.first.isValid() || remote.cbHandle.second.isValid()) {
+                return true;
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (remote.cbHandle.isValid()) {
+                return true;
+            }
         }
     }
 
     return false;
 }
 
+//SAM done
 void AsyncResultsMerger::_scheduleKillCursors(WithLock, OperationContext* opCtx) {
     invariant(_killCompleteEvent.isValid());
 
-    for (const auto& remote : _remotes) {
-        if (remote.status.isOK() && remote.cursorId && !remote.exhausted()) {
-            BSONObj cmdObj = KillCursorsRequest(_params->nsString, {remote.cursorId}).toBSON();
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (remote.status.isOK() && remote.cursorId.first && !remote.exhausted()) {
+                BSONObj cmdObj = KillCursorsRequest(_params->nsString, {remote.cursorId.first}).toBSON();
 
-            executor::RemoteCommandRequest request(
-                remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, opCtx);
+                executor::RemoteCommandRequest request(
+                    remote.getFirstTargetHost(), _params->nsString.db().toString(), cmdObj, opCtx);
 
-            // Send kill request; discard callback handle, if any, or failure report, if not.
-            _executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
+                // Send kill request; discard callback handle, if any, or failure report, if not.
+                _executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
+            }
+            if (remote.status.isOK() && remote.cursorId.second && !remote.exhausted()) {
+                BSONObj cmdObj = KillCursorsRequest(_params->nsString, {remote.cursorId.second}).toBSON();
+
+                executor::RemoteCommandRequest request(
+                    remote.getSecondTargetHost(), _params->nsString.db().toString(), cmdObj, opCtx);
+
+                // Send kill request; discard callback handle, if any, or failure report, if not.
+                _executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (remote.status.isOK() && remote.cursorId && !remote.exhausted()) {
+                BSONObj cmdObj = KillCursorsRequest(_params->nsString, {remote.cursorId}).toBSON();
+
+                executor::RemoteCommandRequest request(
+                    remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, opCtx);
+
+                // Send kill request; discard callback handle, if any, or failure report, if not.
+                _executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
+            }
         }
     }
 }
 
+// SAM done
 executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -691,10 +1186,21 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* o
 
     _lifecycleState = kKillStarted;
 
-    // Cancel all of our callbacks. Once they all complete, the event will be signaled.
-    for (const auto& remote : _remotes) {
-        if (remote.cbHandle.isValid()) {
-            _executor->cancel(remote.cbHandle);
+    // Cancel all of our callbacks. Once they all complete, the event will be signaled
+    if (isDANS) {
+        for (const auto& remote : _DANSremotes) {
+            if (remote.cbHandle.first.isValid()) {
+                _executor->cancel(remote.cbHandle.first);
+            }
+            if (remote.cbHandle.second.isValid()) {
+                _executor->cancel(remote.cbHandle.second);
+            }
+        }
+    } else {
+        for (const auto& remote : _remotes) {
+            if (remote.cbHandle.isValid()) {
+                _executor->cancel(remote.cbHandle);
+            }
         }
     }
     return _killCompleteEvent;
@@ -721,6 +1227,37 @@ bool AsyncResultsMerger::RemoteCursorData::hasNext() const {
 
 bool AsyncResultsMerger::RemoteCursorData::exhausted() const {
     return cursorId == 0;
+}
+
+//
+// AsyncResultsMerger::DANSRemoteCursorData
+//
+
+// SAM: I have no idea if I really need this pair of nssstring
+// I'm so tired of this it's horrible
+AsyncResultsMerger::DANSRemoteCursorData::DANSRemoteCursorData(
+    std::pair<HostAndPort, HostAndPort> hostAndPort,
+    std::pair<NamespaceString, NamespaceString> cursorNss,
+    std::pair<CursorId, CursorId> establishedCursorId)
+    : cursorId(establishedCursorId),
+      cursorNss(std::move(cursorNss)),
+      shardHostAndPort(std::move(hostAndPort)) {}
+
+const HostAndPort& AsyncResultsMerger::DANSRemoteCursorData::getFirstTargetHost() const {
+    return shardHostAndPort.first;
+}
+
+const HostAndPort& AsyncResultsMerger::DANSRemoteCursorData::getSecondTargetHost() const {
+    return shardHostAndPort.second;
+}
+
+bool AsyncResultsMerger::DANSRemoteCursorData::hasNext() const {
+    return !docBuffer.empty();
+}
+
+bool AsyncResultsMerger::DANSRemoteCursorData::exhausted() const {
+    bool exhausted = (cursorId.first == 0 && cursorId.second == 0);
+    return exhausted;
 }
 
 //

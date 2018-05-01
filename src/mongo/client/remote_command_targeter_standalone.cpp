@@ -47,6 +47,12 @@ StatusWith<HostAndPort> RemoteCommandTargeterStandalone::findHostWithMaxWait(
     return _hostAndPort;
 }
 
+std::pair<HostAndPort, HostAndPort> RemoteCommandTargeterStandalone::getDualMatchingHosts(
+    const ReadPreferenceSetting& readPref) {
+    return std::make_pair(_hostAndPort, _hostAndPort);
+}
+
+
 StatusWith<HostAndPort> RemoteCommandTargeterStandalone::findHost(
     OperationContext* opCtx, const ReadPreferenceSetting& readPref) {
     return _hostAndPort;

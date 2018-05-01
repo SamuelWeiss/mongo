@@ -92,6 +92,7 @@ public:
      */
     StatusWith<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
                                              Milliseconds maxWait = kDefaultFindHostTimeout);
+    std::pair<HostAndPort, HostAndPort> getDualMatchingHosts(const ReadPreferenceSetting& readPref);
 
     /**
      * Returns the host we think is the current master or uasserts.

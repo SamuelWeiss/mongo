@@ -50,6 +50,7 @@ const int kMaxNumFailedHostRetryAttempts = 3;
 
 }  // namespace
 
+// SAM: DANS here how?
 AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
                                          executor::TaskExecutor* executor,
                                          StringData dbName,
@@ -79,6 +80,40 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _scheduleRequests(lk);
 }
+
+// AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
+//                                          executor::TaskExecutor* executor,
+//                                          StringData dbName,
+//                                          const std::vector<std::pair<AsyncRequestsSender::Request,
+//                                                                      AsyncRequestsSender::Request>>& requests,
+//                                          const ReadPreferenceSetting& readPreference,
+//                                          Shard::RetryPolicy retryPolicy)
+//     : _opCtx(opCtx),
+//       _executor(executor),
+//       _db(dbName.toString()),
+//       _readPreference(readPreference),
+//       _retryPolicy(retryPolicy) {
+//
+//     // how does this translate to DANS
+//     for (const auto& request : requests) {
+//         _remotes.emplace_back(request.shardId, request.cmdObj);
+//     }
+//
+//     // Initialize command metadata to handle the read preference.
+//     _metadataObj = readPreference.toContainingBSON();
+//
+//     // Schedule the requests immediately.
+//
+//     // We must create the notification before scheduling any requests, because the notification is
+//     // signaled both on an error in scheduling the request and a request's callback.
+//     _notification.emplace();
+//
+//     // We lock so that no callbacks signal the notification until after we are done scheduling
+//     // requests, to prevent signaling the notification twice, which is illegal.
+//     stdx::lock_guard<stdx::mutex> lk(_mutex);
+//     _scheduleRequests(lk);
+// }
+
 AsyncRequestsSender::~AsyncRequestsSender() {
     _cancelPendingRequests();
 
@@ -165,6 +200,40 @@ boost::optional<AsyncRequestsSender::Response> AsyncRequestsSender::_ready() {
                                 std::move(remote.swResponse->getStatus()),
                                 std::move(remote.shardHostAndPort));
             }
+        } else if (remote.DANSswResponses.first && !remote.primaryDone) {
+            remote.primaryDone = true;
+            // SAM: don't return here, only return when we have both responses
+            if (!remote.DANSswResponses.first->isOK()) {
+                // If _interruptStatus is set, promote CallbackCanceled errors to it.
+                if (!_interruptStatus.isOK() &&
+                    ErrorCodes::CallbackCanceled == remote.DANSswResponses.first->getStatus().code()) {
+                    remote.swResponse = _interruptStatus;
+                }
+                const HostAndPort hp = remote.DANSHostAndPorts.get().first;
+                return Response(std::move(remote.shardId),
+                                (executor::RemoteCommandResponse)std::move(remote.DANSswResponses.first->getStatus()),
+                                (HostAndPort)std::move(hp));
+            }
+        } else if (remote.DANSswResponses.second && !remote.secondaryDone) {
+            remote.secondaryDone = true;
+            if (!remote.DANSswResponses.second->isOK()) {
+                // If _interruptStatus is set, promote CallbackCanceled errors to it.
+                if (!_interruptStatus.isOK() &&
+                    ErrorCodes::CallbackCanceled == remote.DANSswResponses.second->getStatus().code()) {
+                    remote.swResponse = _interruptStatus;
+                }
+                const HostAndPort hp = remote.DANSHostAndPorts.get().second;
+                return Response(std::move(remote.shardId),
+                                (executor::RemoteCommandResponse)std::move(remote.DANSswResponses.second->getStatus()),
+                                (HostAndPort)std::move(hp));
+            }
+        }
+        if (remote.primaryDone && remote.secondaryDone) {
+            invariant(remote.DANSHostAndPorts);
+            // SAM: TODO: not quite right
+            return Response(std::move(remote.shardId),
+                            std::move(remote.swResponse->getValue()),
+                            std::move(*remote.DANSHostAndPorts));
         }
     }
     // No remotes were ready.
@@ -178,12 +247,23 @@ void AsyncRequestsSender::_scheduleRequests(WithLock lk) {
     for (size_t i = 0; i < _remotes.size(); ++i) {
         auto& remote = _remotes[i];
 
+        // SAM: TODO: check both swResponse?
+        // check to see if there's any response
+          // if so handle either or both
+        // otherwise, schedule another request
+
         // First check if the remote had a retriable error, and if so, clear its response field so
         // it will be retried.
-        if (remote.swResponse && !remote.done) {
+
+        bool singleRemoteResponse = remote.swResponse && !remote.done;
+        bool primaryRemoteResponse = remote.DANSswResponses.first && !remote.primaryDone;
+        bool secondaryRemoteResponse = remote.DANSswResponses.second && !remote.secondaryDone;
+
+        if (singleRemoteResponse) {
             // We check both the response status and command status for a retriable error.
             Status status = remote.swResponse->getStatus();
             if (status.isOK()) {
+                // SAM: TODO: handle DANS related things here
                 status = getStatusFromCommandResult(remote.swResponse->getValue().data);
             }
 
@@ -211,11 +291,76 @@ void AsyncRequestsSender::_scheduleRequests(WithLock lk) {
             }
         }
 
+        if (primaryRemoteResponse) {
+            // We check both the response status and command status for a retriable error.
+            Status status = remote.DANSswResponses.first->getStatus();
+            if (status.isOK()) {
+                status = getStatusFromCommandResult(remote.DANSswResponses.first->getValue().data);
+            }
+
+            if (!status.isOK()) {
+                // There was an error with either the response or the command.
+                auto shard = remote.getShard();
+                if (!shard) {
+                    remote.DANSswResponses.first =
+                        Status(ErrorCodes::ShardNotFound,
+                               str::stream() << "Could not find shard " << remote.shardId);
+                } else {
+                    if (remote.DANSHostAndPorts) {
+                        shard->updateReplSetMonitor(remote.DANSHostAndPorts.get().first, status);
+                    }
+                    if (shard->isRetriableError(status.code(), _retryPolicy) &&
+                        remote.primaryRetryCount < kMaxNumFailedHostRetryAttempts) {
+                        LOG(1) << "Command to remote " << remote.shardId << " at host "
+                               << remote.DANSHostAndPorts.get().first
+                               << " failed with retriable error and will be retried "
+                               << causedBy(redact(status));
+                        ++remote.primaryRetryCount;
+                        remote.DANSswResponses.first.reset();
+                    }
+                }
+            }
+        }
+
+        if (secondaryRemoteResponse) {
+            // We check both the response status and command status for a retriable error.
+            Status status = remote.DANSswResponses.second->getStatus();
+            if (status.isOK()) {
+                status = getStatusFromCommandResult(remote.DANSswResponses.second->getValue().data);
+            }
+
+            if (!status.isOK()) {
+                // There was an error with either the response or the command.
+                auto shard = remote.getShard();
+                if (!shard) {
+                    remote.DANSswResponses.second =
+                        Status(ErrorCodes::ShardNotFound,
+                               str::stream() << "Could not find shard " << remote.shardId);
+                } else {
+                    if (remote.DANSHostAndPorts) {
+                        shard->updateReplSetMonitor(remote.DANSHostAndPorts.get().second, status);
+                    }
+                    if (shard->isRetriableError(status.code(), _retryPolicy) &&
+                        remote.secondaryRetryCount < kMaxNumFailedHostRetryAttempts) {
+                        LOG(1) << "Command to remote " << remote.shardId << " at host "
+                               << remote.DANSHostAndPorts.get().second
+                               << " failed with retriable error and will be retried "
+                               << causedBy(redact(status));
+                        ++remote.secondaryRetryCount;
+                        remote.DANSswResponses.second.reset();
+                    }
+                }
+            }
+        }
+
+
+        // SAM: adapt for DANS?
         // If the remote does not have a response or pending request, schedule remote work for it.
         if (!remote.swResponse && !remote.cbHandle.isValid()) {
           // SAM: i is just the index here
             auto scheduleStatus = _scheduleRequest(lk, i);
             if (!scheduleStatus.isOK()) {
+
                 remote.swResponse = std::move(scheduleStatus);
                 // Signal the notification indicating the remote had an error (we need to do this
                 // because no request was scheduled, so no callback for this remote will run and
@@ -235,25 +380,105 @@ Status AsyncRequestsSender::_scheduleRequest(WithLock, size_t remoteIndex) {
     invariant(!remote.swResponse);
 
     // SAM: ayy, here we go!
+    // but this is only grabbing one, we need to posility to specify one to avoid
     Status resolveStatus = remote.resolveShardIdToHostAndPort(_readPreference);
     if (!resolveStatus.isOK()) {
         return resolveStatus;
     }
 
-    executor::RemoteCommandRequest request(
-        *remote.shardHostAndPort, _db, remote.cmdObj, _metadataObj, _opCtx);
+    // SAM: if our read preference is for dual then we gotta do 2 here
+    if (_readPreference.pref == ReadPreference::DuplicatePrimary) {
+      executor::RemoteCommandRequest request1(
+          remote.DANSHostAndPorts.get().first, _db, remote.cmdObj, _metadataObj, _opCtx);
 
-    auto callbackStatus = _executor->scheduleRemoteCommand(
-        request, [=](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
-            _handleResponse(cbData, remoteIndex);
-        });
-    if (!callbackStatus.isOK()) {
-        return callbackStatus.getStatus();
+      // SAM: TODO: make separate callbacks for populating each response
+      auto callbackStatus1 = _executor->scheduleRemoteCommand(
+          request1, [=](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+              _DANShandleResponse(cbData, remoteIndex, true); // bool is isPrimary
+          });
+      if (!callbackStatus1.isOK()) {
+          return callbackStatus1.getStatus();
+      }
+
+      remote.cbHandles.first = callbackStatus1.getValue();
+
+      executor::RemoteCommandRequest request2(
+          remote.DANSHostAndPorts.get().second, _db, remote.cmdObj, _metadataObj, _opCtx);
+
+      auto callbackStatus2 = _executor->scheduleRemoteCommand(
+          request2, [=](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+              _DANShandleResponse(cbData, remoteIndex, false); // bool is isPrimary
+          });
+
+      // SAM: TODO: only error if one breaks?
+      if (!callbackStatus2.isOK()) {
+          return callbackStatus2.getStatus();
+      }
+
+      remote.cbHandles.second = callbackStatus2.getValue();
+
+    } else {
+      executor::RemoteCommandRequest request(
+          *remote.shardHostAndPort, _db, remote.cmdObj, _metadataObj, _opCtx);
+
+      auto callbackStatus = _executor->scheduleRemoteCommand(
+          request, [=](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+              _handleResponse(cbData, remoteIndex);
+          });
+      if (!callbackStatus.isOK()) {
+          return callbackStatus.getStatus();
+      }
+
+      remote.cbHandle = callbackStatus.getValue();
     }
-
-    remote.cbHandle = callbackStatus.getValue();
     return Status::OK();
 }
+
+// SAM: TODO: do this -> god that's the worst comment I've ever written I need to get a grip
+void AsyncRequestsSender::_DANShandleResponse(
+    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
+    size_t remoteIndex,
+    bool isPrimary) {
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    auto& remote = _remotes[remoteIndex];
+
+    // split on isPrimary
+    if (isPrimary) {
+        invariant(!remote.DANSswResponses.first);
+
+        // Clear the callback handle. This indicates that we are no longer waiting on a response from
+        // 'remote'.
+        remote.cbHandles.first = executor::TaskExecutor::CallbackHandle();
+
+        // Store the response or error.
+        if (cbData.response.status.isOK()) {
+            remote.DANSswResponses.first = std::move(cbData.response);
+        } else {
+            remote.DANSswResponses.first = std::move(cbData.response.status);
+        }
+    } else {
+        invariant(!remote.DANSswResponses.second);
+
+        // Clear the callback handle. This indicates that we are no longer waiting on a response from
+        // 'remote'.
+        remote.cbHandles.second = executor::TaskExecutor::CallbackHandle();
+
+        // Store the response or error.
+        if (cbData.response.status.isOK()) {
+            remote.DANSswResponses.second = std::move(cbData.response);
+        } else {
+            remote.DANSswResponses.second = std::move(cbData.response.status);
+        }
+    }
+
+    // Signal the notification indicating that a remote received a response.
+    if (!*_notification) {
+        _notification->set();
+    }
+}
+
 
 void AsyncRequestsSender::_handleResponse(
     const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData, size_t remoteIndex) {
@@ -289,14 +514,42 @@ AsyncRequestsSender::Response::Response(ShardId shardId,
       swResponse(std::move(response)),
       shardHostAndPort(std::move(hp)) {}
 
+// AsyncRequestsSender::Response::Response(ShardId shardId,
+//                                         executor::RemoteCommandResponse response,
+//                                         HostAndPort hp) {
+//         shardId = std::move(shardId);
+//         swResponse = std::move(response);
+//         shardHostAndPort = std::move(hp);
+//       }
+
+AsyncRequestsSender::Response::Response(ShardId shardId,
+                                        executor::RemoteCommandResponse response,
+                                        std::pair<HostAndPort, HostAndPort> hp)
+    : shardId(std::move(shardId)),
+      swResponse(std::move(response)),
+      DANSHostAndPorts(std::move(hp)) {}
+// {
+//   shardId = std::move(shardId);
+//   swResponse = std::move(response);
+//   DANSHostAndPorts = std::move(hp);
+// }
+
+
 AsyncRequestsSender::Response::Response(ShardId shardId,
                                         Status status,
                                         boost::optional<HostAndPort> hp)
     : shardId(std::move(shardId)), swResponse(std::move(status)), shardHostAndPort(std::move(hp)) {}
 
+// AsyncRequestsSender::Response::Response(ShardId shardId,
+//                                         Status status,
+//                                         boost::optional<std::pair<HostAndPort, HostAndPort>> hp)
+//     : shardId(std::move(shardId)), swResponse(std::move(status)), DANSHostAndPorts(std::move(hp)) {}
+
 AsyncRequestsSender::RemoteData::RemoteData(ShardId shardId, BSONObj cmdObj)
     : shardId(std::move(shardId)), cmdObj(std::move(cmdObj)) {}
 
+
+//SAM TODO: add an optional parameter?
 Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
     const ReadPreferenceSetting& readPref) {
     const auto shard = getShard();
@@ -307,12 +560,19 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
 
     // SAM: idea: modify readPref so it can capture if it's a duplicate
     // Then modify findHostWithMaxWait so it grabs the second option
-    auto findHostStatus = shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20});
-    if (!findHostStatus.isOK()) {
-        return findHostStatus.getStatus();
+    if (readPref.pref == ReadPreference::DuplicatePrimary) {
+      // auto findHostStatus = shard->getTargeter()->getDualMatchingHosts(readPref);
+      DANSHostAndPorts = shard->getTargeter()->getDualMatchingHosts(readPref);
+      // SAM TODO: get status here
+
+    } else {
+      auto findHostStatus = shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20});
+      if (!findHostStatus.isOK()) {
+          return findHostStatus.getStatus();
+      }
+      shardHostAndPort = std::move(findHostStatus.getValue());
     }
 
-    shardHostAndPort = std::move(findHostStatus.getValue());
 
     return Status::OK();
 }

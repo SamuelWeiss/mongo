@@ -165,6 +165,8 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     return std::move(newQR);
 }
 
+
+/*
 CursorId boopQuery(OperationContext* opCtx,
                    ClusterClientCursorParams params,
                    const CanonicalQuery *query,
@@ -286,6 +288,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                  ChunkManager* chunkManager,
                                  std::shared_ptr<Shard> primary,
                                  std::vector<BSONObj>* results) {
+    log() << "Running query without retry!";
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
     // Get the set of shards on which we will run the query.
@@ -305,6 +308,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         shards.emplace_back(std::move(primary));
     }
 
+    log() << "Building params!";
     auto params1 = buildParams(query, readPref);
     auto params2 = buildParams(query, readPref);
 
@@ -342,13 +346,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
     // Establish the cursors with a consistent shardVersion across shards.
     // SAM: maybe this is the place to be?
-    // params.remotes = establishCursors(opCtx,
-    //                                   Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-    //                                   query.nss(),
-    //                                   readPref,
-    //                                   requests, // SAM: where is request coming from, it's just a shardID and bson
-    //                                   query.getQueryRequest().isAllowPartialResults());
-
+    log() << "Making Dual Cursors";
     auto dualRemotes = establishDualCursors(opCtx,
                                             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                                             query.nss(),
@@ -398,6 +396,176 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     }
     // SAM TODO: what else should I return here?
     return CursorId(0);
+}
+
+*/
+
+CursorId runQueryWithoutRetrying(OperationContext* opCtx,
+                                 const CanonicalQuery& query,
+                                 const ReadPreferenceSetting& readPref,
+                                 ChunkManager* chunkManager,
+                                 std::shared_ptr<Shard> primary,
+                                 std::vector<BSONObj>* results) {
+    auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+    // Get the set of shards on which we will run the query.
+
+    std::vector<std::shared_ptr<Shard>> shards;
+    if (chunkManager) {
+        std::set<ShardId> shardIds;
+        chunkManager->getShardIdsForQuery(opCtx,
+                                          query.getQueryRequest().getFilter(),
+                                          query.getQueryRequest().getCollation(),
+                                          &shardIds);
+
+        for (auto id : shardIds) {
+            shards.emplace_back(uassertStatusOK(shardRegistry->getShard(opCtx, id)));
+        }
+    } else {
+        shards.emplace_back(std::move(primary));
+    }
+
+    // Construct the query and parameters.
+
+    ClusterClientCursorParams params(query.nss(), readPref);
+    params.limit = query.getQueryRequest().getLimit();
+    params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
+    params.skip = query.getQueryRequest().getSkip();
+    params.tailableMode = query.getQueryRequest().getTailableMode();
+    params.isAllowPartialResults = query.getQueryRequest().isAllowPartialResults();
+
+    // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
+    // usually use the batchSize associated with the initial find, but as it is illegal to send a
+    // getMore with a batchSize of 0, we set it to use the default batchSize logic.
+    if (params.batchSize && *params.batchSize == 0) {
+        params.batchSize = boost::none;
+    }
+
+    // $natural sort is actually a hint to use a collection scan, and shouldn't be treated like a
+    // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
+    // being considered a hint to use a collection scan.
+    if (!query.getQueryRequest().getSort().hasField("$natural")) {
+        params.sort = FindCommon::transformSortSpec(query.getQueryRequest().getSort());
+    }
+
+    bool appendGeoNearDistanceProjection = false;
+    if (query.getQueryRequest().getSort().isEmpty() &&
+        QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)) {
+        // There is no specified sort, and there is a GEO_NEAR node. This means we should merge sort
+        // by the geoNearDistance. Request the projection {$sortKey: <geoNearDistance>} from the
+        // shards. Indicate to the AsyncResultsMerger that it should extract the sort key
+        // {"$sortKey": <geoNearDistance>} and sort by the order {"$sortKey": 1}.
+        params.sort = AsyncResultsMerger::kWholeSortKeySortPattern;
+        params.compareWholeSortKey = true;
+        appendGeoNearDistanceProjection = true;
+    }
+
+    // Tailable cursors can't have a sort, which should have already been validated.
+    invariant(params.sort.isEmpty() || !query.getQueryRequest().isTailable());
+
+    const auto qrToForward = uassertStatusOK(
+        transformQueryForShards(query.getQueryRequest(), appendGeoNearDistanceProjection));
+    // Construct the find command that we will use to establish cursors, attaching the shardVersion.
+
+
+    // SAM: TODO: how should I modify requests here?
+    std::vector<std::pair<ShardId, BSONObj>> requests;
+    for (const auto& shard : shards) {
+        invariant(!shard->isConfig() || shard->getConnString().type() != ConnectionString::INVALID);
+
+        BSONObjBuilder cmdBuilder;
+        qrToForward->asFindCommand(&cmdBuilder);
+
+        if (chunkManager) {
+            ChunkVersion version(chunkManager->getVersion(shard->getId()));
+            version.appendForCommands(&cmdBuilder);
+        } else if (!query.nss().isOnInternalDb()) {
+            ChunkVersion version(ChunkVersion::UNSHARDED());
+            version.appendForCommands(&cmdBuilder);
+        }
+
+        requests.emplace_back(shard->getId(), cmdBuilder.obj());
+    }
+
+    // Establish the cursors with a consistent shardVersion across shards.
+
+    // SAM: is this returning the right thing?
+    // no, it's returning DANS remotes when remotes is expecting vanilla remotes
+    params.DANSRemotes = establishDualCursors(opCtx,
+                                          Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                                          query.nss(),
+                                          readPref,
+                                          requests,
+                                          query.getQueryRequest().isAllowPartialResults());
+    params.isDANS = true;
+
+    // Determine whether the cursor we may eventually register will be single- or multi-target.
+
+    const auto cursorType = params.remotes.size() > 1
+        ? ClusterCursorManager::CursorType::MultiTarget
+        : ClusterCursorManager::CursorType::SingleTarget;
+
+    // Transfer the established cursors to a ClusterClientCursor.
+
+    auto ccc = ClusterClientCursorImpl::make(
+        opCtx, Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
+
+    // Retrieve enough data from the ClusterClientCursor for the first batch of results.
+
+    auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    int bytesBuffered = 0;
+
+    while (!FindCommon::enoughForFirstBatch(query.getQueryRequest(), results->size())) {
+        auto next = uassertStatusOK(ccc->next(RouterExecStage::ExecContext::kInitialFind));
+
+        if (next.isEOF()) {
+            // We reached end-of-stream. If the cursor is not tailable, then we mark it as
+            // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even
+            // when we reach end-of-stream. However, if all the remote cursors are exhausted, there
+            // is no hope of returning data and thus we need to close the mongos cursor as well.
+            if (!ccc->isTailable() || ccc->remotesExhausted()) {
+                cursorState = ClusterCursorManager::CursorState::Exhausted;
+            }
+            break;
+        }
+
+        auto nextObj = *next.getResult();
+
+        // If adding this object will cause us to exceed the message size limit, then we stash it
+        // for later.
+        if (!FindCommon::haveSpaceForNext(nextObj, results->size(), bytesBuffered)) {
+            ccc->queueResult(nextObj);
+            break;
+        }
+
+        // Add doc to the batch. Account for the space overhead associated with returning this doc
+        // inside a BSON array.
+        bytesBuffered += (nextObj.objsize() + kPerDocumentOverheadBytesUpperBound);
+        results->push_back(std::move(nextObj));
+    }
+
+    ccc->detachFromOperationContext();
+
+    if (!query.getQueryRequest().wantMore() && !ccc->isTailable()) {
+        cursorState = ClusterCursorManager::CursorState::Exhausted;
+    }
+
+    // If the cursor is exhausted, then there are no more results to return and we don't need to
+    // allocate a cursor id.
+    if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
+        return CursorId(0);
+    }
+
+    // Register the cursor with the cursor manager for subsequent getMore's.
+
+    auto cursorManager = Grid::get(opCtx)->getCursorManager();
+    const auto cursorLifetime = query.getQueryRequest().isNoCursorTimeout()
+        ? ClusterCursorManager::CursorLifetime::Immortal
+        : ClusterCursorManager::CursorLifetime::Mortal;
+    auto authUsers = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames();
+
+    return uassertStatusOK(cursorManager->registerCursor(
+        opCtx, ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime, authUsers));
 }
 
 }  // namespace

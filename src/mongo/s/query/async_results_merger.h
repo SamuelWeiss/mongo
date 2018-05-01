@@ -198,6 +198,12 @@ public:
     void addNewShardCursors(const std::vector<ClusterClientCursorParams::RemoteCursor>& newCursors);
 
     /**
+     * Adds the specified shard cursors to the set of cursors to be merged.  The results from the
+     * new cursors will be returned as normal through nextReady().
+     */
+    void addNewShardCursors(const std::vector<ClusterClientCursorParams::DANSRemoteCursor>& newCursors);
+
+    /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
      * on all of the unexhausted remotes. Returns a handle to an event that is signaled when this
      * ARM is safe to destroy.
@@ -221,7 +227,9 @@ public:
      */
     void blockingKill(OperationContext*);
 
-private:
+// SAM TODO: make this work as private
+// private:
+public:
     /**
      * We instantiate one of these per remote host. It contains the buffer of results we've
      * retrieved from the host but not yet returned, as well as the cursor id, and any error
@@ -281,6 +289,65 @@ private:
         long long fetchedCount = 0;
     };
 
+    struct DANSRemoteCursorData {
+        DANSRemoteCursorData(std::pair<HostAndPort, HostAndPort> hostAndPort,
+                             std::pair<NamespaceString, NamespaceString> cursorNss,
+                             std::pair<CursorId, CursorId> establishedCursorId);
+
+        /**
+         * Returns the resolved host and port on which the remote cursor resides.
+         */
+        const HostAndPort& getFirstTargetHost() const;
+
+        const HostAndPort& getSecondTargetHost() const;
+
+        /**
+         * Returns whether there is another buffered result available for this remote node.
+         */
+        bool hasNext() const;
+
+        /**
+         * Returns whether the remote has given us all of its results (i.e. whether it has closed
+         * its cursor).
+         */
+        bool exhausted() const;
+
+        // Used when merging tailable awaitData cursors in sorted order. In order to return any
+        // result to the client we have to know that no shard will ever return anything that sorts
+        // before it. This object represents a promise from the remote that it will never return a
+        // result with a sort key lower than this.
+        boost::optional<BSONObj> promisedMinSortKey;
+
+        // The cursor id for the remote cursor. If a remote cursor is not yet exhausted, this member
+        // will be set to a valid non-zero cursor id. If a remote cursor is now exhausted, this
+        // member will be set to zero.
+        std::pair<CursorId,CursorId> cursorId;
+
+        // The namespace this cursor belongs to - note this may be different than the namespace of
+        // the operation if there is a view.
+        std::pair<NamespaceString, NamespaceString> cursorNss;
+
+        // The exact host in the shard on which the cursor resides.
+        std::pair<HostAndPort, HostAndPort> shardHostAndPort;
+
+        // The buffer of results that have been retrieved but not yet returned to the caller.
+        std::queue<ClusterQueryResult> docBuffer;
+
+        // Is valid if there is currently a pending request to this remote.
+        // SAM: do I need to mess with this?
+        // executor::TaskExecutor::CallbackHandle cbHandle;
+        std::pair<executor::TaskExecutor::CallbackHandle,
+                  executor::TaskExecutor::CallbackHandle> cbHandle;
+
+        // Set to an error status if there is an error retrieving a response from this remote or if
+        // the command result contained an error.
+        Status status = Status::OK();
+
+        // Count of fetched docs during ARM processing of the current batch. Used to reduce the
+        // batchSize in getMore when mongod returned less docs than the requested batchSize.
+        long long fetchedCount = 0;
+    };
+
     class MergingComparator {
     public:
         MergingComparator(const std::vector<RemoteCursorData>& remotes,
@@ -310,6 +377,14 @@ private:
      */
     static StatusWith<CursorResponse> _parseCursorResponse(const BSONObj& responseObj,
                                                            const RemoteCursorData& remote);
+
+    /**
+     * Parses the find or getMore command response object to a CursorResponse.
+     *
+     * Returns a non-OK response if the response fails to parse or if there is a cursor id mismatch.
+     */
+    static StatusWith<CursorResponse> _parseCursorResponse(const BSONObj& responseObj,
+                                                           const DANSRemoteCursorData& remote);
 
     /**
      * Helper to schedule a command asking the remote node for another batch of results.
@@ -374,6 +449,8 @@ private:
      * parsing the batch.
      */
     bool _addBatchToBuffer(WithLock, size_t remoteIndex, const CursorResponse& response);
+    bool _addBatchToBuffer(WithLock, size_t remoteIndex, const std::pair<CursorResponse, CursorResponse>& responses);
+
 
     /**
      * If there is a valid unsignaled event that has been requested via nextEvent() and there are
@@ -398,6 +475,8 @@ private:
      * Updates 'remote's metadata (e.g. the cursor id) based on information in 'response'.
      */
     void updateRemoteMetadata(RemoteCursorData* remote, const CursorResponse& response);
+    void updateRemoteMetadata(DANSRemoteCursorData* remote, const CursorResponse& response);
+
 
     OperationContext* _opCtx;
     executor::TaskExecutor* _executor;
@@ -412,6 +491,12 @@ private:
 
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteCursorData> _remotes;
+
+    // Data tracking the state of our communication with each of the remote nodes.
+    std::vector<DANSRemoteCursorData> _DANSremotes;
+
+    // track for convenience
+    bool isDANS;
 
     // The top of this priority queue is the index into '_remotes' for the remote host that has the
     // next document to return, according to the sort order. Used only if there is a sort.

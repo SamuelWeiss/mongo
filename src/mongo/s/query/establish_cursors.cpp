@@ -51,8 +51,7 @@ namespace mongo {
 // this would take the form of a pair of vectors
 // they would need some awareness that they are the duplicates
 // if read_preference is master only then the second one will be optional (void)
-std::pair<std::vector<ClusterClientCursorParams::RemoteCursor>,
-          std::vector<ClusterClientCursorParams::RemoteCursor>> establishDualCursors(
+std::vector<ClusterClientCursorParams::DANSRemoteCursor> establishDualCursors(
     OperationContext* opCtx,
     executor::TaskExecutor* executor,
     const NamespaceString& nss,
@@ -66,27 +65,118 @@ std::pair<std::vector<ClusterClientCursorParams::RemoteCursor>,
     auto primPref = ReadPreferenceSetting(ReadPreference::DuplicatePrimary,
                                           readPref.tags,
                                           readPref.maxStalenessSeconds);
-    auto primaries = establishCursors(opCtx,
-                                      executor,
-                                      nss,
-                                      primPref,
-                                      remotes,
-                                      allowPartialResults);
-    // readPref.pref = ReadPreference::DuplicateSecondary;
-    auto secPref = ReadPreferenceSetting(ReadPreference::DuplicateSecondary,
-                                         readPref.tags,
-                                         readPref.maxStalenessSeconds);
-    auto secondaries = establishCursors(opCtx,
-                                        executor,
-                                        nss,
-                                        secPref,
-                                        remotes,
-                                        allowPartialResults);
-    // SAM TODO: can't copy the things
-    std::pair <std::vector<ClusterClientCursorParams::RemoteCursor>,
-               std::vector<ClusterClientCursorParams::RemoteCursor>> res (std::move(primaries),
-                                                                          std::move(secondaries));
-    return res;
+
+    // SAM: TODO: need to do more than this
+    // auto primaries = establishCursors(opCtx,
+    //                                   executor,
+    //                                   nss,
+    //                                   primPref,
+    //                                   remotes,
+    //                                   allowPartialResults);
+    // SAM: I've updated the way that cursors work so now there's
+    // actually two host and ports in each. only return one ClusterClientCursor
+    // return primaries;
+
+    std::vector<AsyncRequestsSender::Request> requests;
+    for (const auto& remote : remotes) {
+        requests.emplace_back(remote.first, remote.second);
+    }
+
+    // Send the requests
+    AsyncRequestsSender ars(opCtx,
+                            executor,
+                            nss.db().toString(),
+                            std::move(requests), // SAM: do I need to modify these?
+                            primPref, // alteration
+                            Shard::RetryPolicy::kIdempotent);
+
+    std::vector<ClusterClientCursorParams::DANSRemoteCursor> remoteCursors;
+    try {
+        // Get the responses
+        while (!ars.done()) {
+            try {
+                auto response = ars.next();
+
+                // parse a DANSRemoteCursor
+                // uasserts must happen before attempting to access the optional shardHostAndPort.
+                // auto primaryCursorResponse = uassertStatusOK(CursorResponse::parseFromBSON(
+                //     uassertStatusOK(std::move(response.DANSswResponses.first)).data));
+                //
+                // auto secondaryCursorResponse = uassertStatusOK(CursorResponse::parseFromBSON(
+                //     uassertStatusOK(std::move(response.DANSswResponses.second)).data));
+                auto dummyCursorResponse = uassertStatusOK(CursorResponse::parseFromBSON(
+                    uassertStatusOK(std::move(response.swResponse)).data));
+
+                // SAM: this should work with DANS
+                remoteCursors.emplace_back(std::move(response.shardId),
+                                           std::move(*response.DANSHostAndPorts),
+                                           std::move(std::make_pair(
+                                                std::move(dummyCursorResponse),
+                                                std::move(dummyCursorResponse))));
+            } catch (const DBException& ex) {
+                // Retriable errors are swallowed if 'allowPartialResults' is true.
+                if (allowPartialResults &&
+                    std::find(RemoteCommandRetryScheduler::kAllRetriableErrors.begin(),
+                              RemoteCommandRetryScheduler::kAllRetriableErrors.end(),
+                              ex.code()) !=
+                        RemoteCommandRetryScheduler::kAllRetriableErrors.end()) {
+                    continue;
+                }
+                throw;  // Fail this loop.
+            }
+        }
+        return remoteCursors;
+    } catch (const DBException&) {
+        // SAM: not gonna worry about this RN
+
+
+
+        // If one of the remotes had an error, we make a best effort to finish retrieving responses
+        // for other requests that were already sent, so that we can send killCursors to any cursors
+        // that we know were established.
+        // try {
+        //     // Do not schedule any new requests.
+        //     ars.stopRetrying();
+        //
+        //     // Collect responses from all requests that were already sent.
+        //     while (!ars.done()) {
+        //         auto response = ars.next();
+        //
+        //         // Check if the response contains an established cursor, and if so, store it.
+        //         StatusWith<CursorResponse> swCursorResponse(
+        //             response.swResponse.isOK()
+        //                 ? CursorResponse::parseFromBSON(response.swResponse.getValue().data)
+        //                 : response.swResponse.getStatus());
+        //
+        //         if (swCursorResponse.isOK()) {
+        //             remoteCursors.emplace_back(std::move(response.shardId),
+        //                                        *response.shardHostAndPort,
+        //                                        std::move(swCursorResponse.getValue()));
+        //         }
+        //     }
+        //
+        //     // Schedule killCursors against all cursors that were established.
+        //     for (const auto& remoteCursor : remoteCursors) {
+        //         BSONObj cmdObj =
+        //             KillCursorsRequest(nss, {remoteCursor.cursorResponse.getCursorId()}).toBSON();
+        //         executor::RemoteCommandRequest request(
+        //             remoteCursor.hostAndPort, nss.db().toString(), cmdObj, opCtx);
+        //
+        //         // We do not process the response to the killCursors request (we make a good-faith
+        //         // attempt at cleaning up the cursors, but ignore any returned errors).
+        //         executor
+        //             ->scheduleRemoteCommand(
+        //                 request,
+        //                 [](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {})
+        //             .status_with_transitional_ignore();
+        //     }
+        // } catch (const DBException&) {
+        //     // Ignore the new error and rethrow the original one.
+        // }
+
+        throw;
+    }
+
 }
 
 std::vector<ClusterClientCursorParams::RemoteCursor> establishCursors(
@@ -121,6 +211,7 @@ std::vector<ClusterClientCursorParams::RemoteCursor> establishCursors(
                 auto cursorResponse = uassertStatusOK(CursorResponse::parseFromBSON(
                     uassertStatusOK(std::move(response.swResponse)).data));
 
+                // SAM: this won't fly for DANS
                 remoteCursors.emplace_back(std::move(response.shardId),
                                            std::move(*response.shardHostAndPort),
                                            std::move(cursorResponse));

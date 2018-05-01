@@ -190,6 +190,8 @@ public:
     BSONObj toBSON(ResponseType responseType) const;
     void addToBSON(ResponseType responseType, BSONObjBuilder* builder) const;
 
+    bool isPrimary;
+
 private:
     NamespaceString _nss;
     CursorId _cursorId;

@@ -77,6 +77,26 @@ struct ClusterClientCursorParams {
         CursorResponse cursorResponse;
     };
 
+    // SAM: make a dual remote cursor here that maintains info for two hostAndPort structs
+    // SAM: TODO: go through and change references from dual to DANS
+    struct DANSRemoteCursor {
+        DANSRemoteCursor(ShardId shardId,
+                         std::pair<HostAndPort,HostAndPort> DANSHostAndPort,
+                         std::pair<CursorResponse, CursorResponse> cursorResponses)
+            : shardId(std::move(shardId)),
+              DANSHostAndPorts(std::move(DANSHostAndPort)),
+              cursorResponses(std::move(cursorResponses)) {}
+
+        // The shardId of the shard on which the cursor resides.
+        ShardId shardId;
+
+        // The exact host (within the shard) on which the cursor resides.
+        std::pair<HostAndPort,HostAndPort> DANSHostAndPorts;
+
+        // Encompasses the state of the established cursor.
+        std::pair<CursorResponse, CursorResponse> cursorResponses;
+    };
+
     ClusterClientCursorParams(NamespaceString nss,
                               boost::optional<ReadPreferenceSetting> readPref = boost::none)
         : nsString(std::move(nss)) {
@@ -90,6 +110,13 @@ struct ClusterClientCursorParams {
 
     // Per-remote node data.
     std::vector<RemoteCursor> remotes;
+
+    // SAM: just throw the DANS stuff in here for now, maybe it's working making
+    // a new ClusterClientCursorParams just for DANS?
+    std::vector<DANSRemoteCursor> DANSRemotes;
+
+    // track for convenience
+    bool isDANS;
 
     // The sort specification. Leave empty if there is no sort.
     BSONObj sort;

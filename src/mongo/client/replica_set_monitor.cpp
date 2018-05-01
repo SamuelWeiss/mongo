@@ -28,6 +28,7 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
+#include "mongo/platform/random.h"
 
 #include "mongo/client/replica_set_monitor.h"
 
@@ -259,6 +260,10 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
     }
 
     _refresherHandle = status.getValue();
+}
+
+std::pair<HostAndPort, HostAndPort> ReplicaSetMonitor::getDualMatchingHosts(const ReadPreferenceSetting& criteria) {
+  return _state->getDualMatchingHosts(criteria);
 }
 
 // SAM: remote_command_targeter entry point
@@ -1032,12 +1037,58 @@ SetState::SetState(const MongoURI& uri)
     setUri = uri;
 }
 
+// SAM: need to get a random hostAndPort and then also get a new one
+
+// SAM: just do geo near? but that's only the secondary
+// maybe do full random here.
+// So at least one of the returned hosts needs to be a secondary (there's only one primary)
+// I think it's fine to get geor near first
+
+//why write this code when we can just throw it in the switch below
+
+HostAndPort SetState::getInitialHost() {
+  // fake a read pref
+  ReadPreferenceSetting mock;
+  mock.pref = ReadPreference::Nearest;
+  return getMatchingHost(mock);
+}
+
+HostAndPort SetState::getNewMatchingHost(const ReadPreferenceSetting& criteria,
+                                         const HostAndPort previousSelection) {
+
+  // find all the nodes that match the preferences
+  // additionally, we need to make sure it's not the host and port we were provided
+  std::vector<const Node*> matchingNodes;
+  for (size_t i = 0; i < nodes.size(); i++) {
+      if (nodes[i].matches(criteria.pref) && !(nodes[i].host == previousSelection)) {
+          matchingNodes.push_back(&nodes[i]);
+      }
+  }
+
+  // if nothing matches, fall over
+  if (matchingNodes.empty()) {
+      return HostAndPort();
+  }
+
+  // Select at random
+  unsigned randomIndex = rand(matchingNodes.size());
+  return matchingNodes.at(randomIndex)->host;
+
+}
+
+std::pair<HostAndPort, HostAndPort> SetState::getDualMatchingHosts(const ReadPreferenceSetting& criteria) {
+  auto primary = getInitialHost();
+  auto secondary = getNewMatchingHost(criteria, primary);
+  std::pair <HostAndPort, HostAndPort> res (std::move(primary), std::move(secondary));
+  return res;
+}
+
+
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
     // SAM: For now I'm just gonna hack this in a pretty basic way
     // TODO: do more to make sure there are no collisions
     switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
-        case ReadPreference::DuplicatePrimary:
         case ReadPreference::PrimaryPreferred: {
             HostAndPort out =
                 getMatchingHost(ReadPreferenceSetting(ReadPreference::PrimaryOnly, criteria.tags));
@@ -1048,7 +1099,6 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
         }
 
-        case ReadPreference::DuplicateSecondary:
         case ReadPreference::SecondaryPreferred: {
             HostAndPort out = getMatchingHost(ReadPreferenceSetting(
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
@@ -1069,6 +1119,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
 
         // The difference between these is handled by Node::matches
         case ReadPreference::SecondaryOnly:
+        case ReadPreference::DuplicatePrimary:
         case ReadPreference::Nearest: {
             stdx::function<bool(const Node&)> matchNode = [](const Node& node) -> bool {
                 return true;

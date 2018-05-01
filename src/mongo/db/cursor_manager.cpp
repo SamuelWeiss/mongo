@@ -710,6 +710,7 @@ void CursorManager::deregisterCursor(ClientCursor* cc) {
     _cursorMap->erase(cc->cursorid());
 }
 
+// SAM maybe a way to kill what I don't need?
 Status CursorManager::killCursor(OperationContext* opCtx, CursorId id, bool shouldAudit) {
     auto lockedPartition = _cursorMap->lockOnePartition(id);
     auto it = lockedPartition->find(id);
@@ -727,6 +728,7 @@ Status CursorManager::killCursor(OperationContext* opCtx, CursorId id, bool shou
         // cursor. It will stop on its own (and remove the cursor) when it sees that it's been
         // interrupted.
         {
+            // SAM: Maybe kill operation directly?
             stdx::unique_lock<Client> lk(*cursor->_operationUsingCursor->getClient());
             cursor->_operationUsingCursor->getServiceContext()->killOperation(
                 cursor->_operationUsingCursor, ErrorCodes::CursorKilled);
@@ -744,6 +746,8 @@ Status CursorManager::killCursor(OperationContext* opCtx, CursorId id, bool shou
     }
 
     lockedPartition->erase(ownedCursor->cursorid());
+
+    // SAM: gotta make sure I don't blow this up if I don't need to
     ownedCursor->dispose(opCtx);
     return Status::OK();
 }

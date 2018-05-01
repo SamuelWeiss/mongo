@@ -109,6 +109,7 @@ StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next(
         return {front};
     }
 
+    // SAM: somehow still digging
     auto next = _root->next(execContext);
     if (next.isOK() && !next.getValue().isEOF()) {
         ++_numReturnedSoFar;
@@ -270,6 +271,7 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
         return buildPipelinePlan(executor, params);
     }
 
+    // SAM: ya know maybe here?
     std::unique_ptr<RouterExecStage> root = createInitialStage(opCtx, executor, params);
 
     if (skip) {

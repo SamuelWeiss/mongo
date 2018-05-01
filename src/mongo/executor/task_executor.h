@@ -237,6 +237,13 @@ public:
     virtual StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
                                                              const RemoteCommandCallbackFn& cb) = 0;
 
+
+     // SAM: bool here is isPrimary
+    std::pair<bool, StatusWith<CallbackHandle>> scheduleDANSRemoteCommand(
+        const RemoteCommandRequest& primaryRequest,
+        const RemoteCommandRequest& secondaryRequest,
+        const RemoteCommandCallbackFn& cb); // override; SAM -> right thing to do?
+
     /**
      * If the callback referenced by "cbHandle" hasn't already executed, marks it as
      * canceled and runnable.

@@ -69,6 +69,12 @@ public:
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) override;
     StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
                                                      const RemoteCommandCallbackFn& cb) override;
+    // SAM: bool here is isPrimary
+    std::pair<bool, StatusWith<CallbackHandle>> scheduleDANSRemoteCommand(
+        const RemoteCommandRequest& primaryRequest,
+        const RemoteCommandRequest& secondaryRequest,
+        const RemoteCommandCallbackFn& cb); //override;
+
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle) override;
 

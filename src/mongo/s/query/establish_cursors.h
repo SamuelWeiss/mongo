@@ -70,8 +70,7 @@ std::vector<ClusterClientCursorParams::RemoteCursor> establishCursors(
     const std::vector<std::pair<ShardId, BSONObj>>& remotes,
     bool allowPartialResults);
 
-std::pair<std::vector<ClusterClientCursorParams::RemoteCursor>,
-          std::vector<ClusterClientCursorParams::RemoteCursor>> establishDualCursors(
+std::vector<ClusterClientCursorParams::DANSRemoteCursor> establishDualCursors(
     OperationContext* opCtx,
     executor::TaskExecutor* executor,
     const NamespaceString& nss,

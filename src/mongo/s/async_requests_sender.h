@@ -107,6 +107,9 @@ public:
         // Constructor that specifies the reason the response was not successfully received.
         Response(ShardId shardId, Status status, boost::optional<HostAndPort> hp);
 
+        Response(ShardId shardId, executor::RemoteCommandResponse response, std::pair<HostAndPort, HostAndPort> hp);
+        Response(ShardId shardId, Status status, boost::optional<std::pair<HostAndPort,HostAndPort>> hp);
+
         // The shard to which the request was sent.
         ShardId shardId;
 
@@ -116,6 +119,13 @@ public:
         // The exact host on which the remote command was run. Is unset if the shard could not be
         // found or no shard hosts matching the readPreference could be found.
         boost::optional<HostAndPort> shardHostAndPort;
+
+        // SAM: do need DANS here
+        boost::optional<std::pair<HostAndPort, HostAndPort>> DANSHostAndPorts;
+
+        // The response or error from the remote.
+        // std::pair<StatusWith<executor::RemoteCommandResponse>,
+        //           StatusWith<executor::RemoteCommandResponse>> DANSswResponses;
     };
 
     /**
@@ -128,6 +138,18 @@ public:
                         const std::vector<AsyncRequestsSender::Request>& requests,
                         const ReadPreferenceSetting& readPreference,
                         Shard::RetryPolicy retryPolicy);
+
+    /**
+     * Constructs a new AsyncRequestsSender. The OperationContext* and TaskExecutor* must remain
+     * valid for the lifetime of the ARS.
+     */
+    // AsyncRequestsSender(OperationContext* opCtx,
+    //                     executor::TaskExecutor* executor,
+    //                     StringData dbName,
+    //                     const std::vector<std::pair<AsyncRequestsSender::Request,
+    //                                                 AsyncRequestsSender::Request>>& requests,
+    //                     const ReadPreferenceSetting& readPreference,
+    //                     Shard::RetryPolicy retryPolicy);
 
     /**
      * Ensures pending network I/O for any outstanding requests has been canceled and waits for
@@ -190,18 +212,35 @@ private:
         // received.
         boost::optional<StatusWith<executor::RemoteCommandResponse>> swResponse;
 
+        std::pair<boost::optional<StatusWith<executor::RemoteCommandResponse>>,
+                  boost::optional<StatusWith<executor::RemoteCommandResponse>>> DANSswResponses;
+
         // The exact host on which the remote command was run. Is unset until a request has been
         // sent.
         boost::optional<HostAndPort> shardHostAndPort;
 
+        // SAM: sure, let's try this.
+        boost::optional<std::pair<HostAndPort, HostAndPort>> DANSHostAndPorts;
+
         // The number of times we've retried sending the command to this remote.
         int retryCount = 0;
+        int primaryRetryCount = 0;
+        int secondaryRetryCount = 0;
 
         // The callback handle to an outstanding request for this remote.
         executor::TaskExecutor::CallbackHandle cbHandle;
 
+        // SAM: Gotta make a pair here too, yay
+        std::pair<executor::TaskExecutor::CallbackHandle,
+                  executor::TaskExecutor::CallbackHandle> cbHandles;
+
+        bool isDANS;
+
+        // SAM: TODO: maybe capture done status for both primary and secondary
         // Whether this remote's result has been returned.
         bool done = false;
+        bool primaryDone = false;
+        bool secondaryDone = false;
     };
 
     /**
@@ -250,6 +289,19 @@ private:
      */
     void _handleResponse(const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
                          size_t remoteIndex);
+
+
+    /**
+     * The callback for a remote command.
+     *
+     * 'remoteIndex' is the position of the relevant remote node in '_remotes', and therefore
+     * indicates which node the response came from and where the response should be buffered.
+     *
+     * Stores the response or error in the remote and signals the notification.
+     */
+    void _DANShandleResponse(const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
+                             size_t remoteIndex,
+                             bool isPrimary);
 
     OperationContext* _opCtx;
 
